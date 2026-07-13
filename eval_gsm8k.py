@@ -20,7 +20,19 @@ def evaluate_model(
     batch_size: int = 4,
     num_samples: int = None,
     save_results: bool = True,
+    gate_mode: str = "standard",
+    save_path: str = None,
 ):
+    """gate_mode selects the gate configuration used at inference and must
+    mirror how the checkpoint was trained (see changes.md mapping #7):
+      - "standard": stock HRPO gate (v4/v5/v6 and the legacy checkpoints);
+      - "unit":     r_t = i_t = 1 via the unit-gate patch (v2/v3);
+      - "disabled": no hybrid blending at all (v1 and base zero-shot —
+                    without an HRPO-trained adapter the gate weights are
+                    random and must not run).
+    adapter_path=None evaluates the base model zero-shot (save_path required
+    if save_results). Defaults reproduce the original behaviour exactly.
+    """
     model, tokenizer = FastLanguageModel.from_pretrained(
         model_name = model_path,
         max_seq_length = 1024,
@@ -31,7 +43,15 @@ def evaluate_model(
     tokenizer.padding_side = "left"
     tokenizer.pad_token = tokenizer.eos_token
 
-    model.load_adapter(adapter_path)
+    if adapter_path is not None:
+        model.load_adapter(adapter_path)
+    if gate_mode == "disabled":
+        model.answer_start = ""
+    elif gate_mode == "unit":
+        from variant_common import apply_unit_gate_patch
+        apply_unit_gate_patch(model)
+    elif gate_mode != "standard":
+        raise ValueError(f"Unknown gate_mode: {gate_mode}")
     model = FastLanguageModel.for_inference(model)
 
     dataset = load_dataset('openai/gsm8k', 'main')['test']
@@ -137,11 +157,14 @@ def evaluate_model(
         'correct': correct,
         'total': total,
         'model_path': adapter_path,
+        'base_model': model_path,
+        'gate_mode': gate_mode,
         'timestamp': datetime.now().isoformat()
     }
 
     if save_results:
-        save_path = adapter_path + "/eval_results.json"
+        if save_path is None:
+            save_path = adapter_path + "/eval_results.json"
         with open(save_path, 'w') as f:
             json.dump({'metrics': metrics, 'results': results}, f, indent=2)
         print(f"\nResults saved to {save_path}")

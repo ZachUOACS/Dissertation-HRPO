@@ -36,7 +36,51 @@ def extract_boxed_answer(text: str) -> str | None:
         return None
 
 
-def get_reward_func(process_answer_func):
+# Reward-shaping constants (ablation variants v5/v6). Both default to 0.0
+# (disabled) so the stock outcome-only reward below is numerically unchanged.
+FORMAT_REWARD = 0.0
+REASONING_BONUS = 0.0
+
+# Minimum characters of reasoning text before ANSWER_START for REASONING_BONUS.
+_MIN_REASONING_CHARS = 10
+
+
+def _is_repetition_loop(
+    text: str,
+    min_len: int = 8,
+    max_len: int = 120,
+    min_repeats: int = 4,
+    tail_chars: int = 600,
+) -> bool:
+    """Detect degenerate repetition loops near the end of a completion.
+
+    Flags the completion when its final `tail_chars` characters contain the
+    same substring (length `min_len`..`max_len`) repeated `min_repeats` or
+    more times back-to-back. Character-level so CJK loops (no whitespace)
+    are caught too.
+    """
+    if not text:
+        return False
+    tail = text[-tail_chars:]
+    pattern = r"(.{%d,%d})\1{%d,}" % (min_len, max_len, min_repeats - 1)
+    return re.search(pattern, tail, re.DOTALL) is not None
+
+
+def get_reward_func(
+    process_answer_func,
+    format_reward: float = None,
+    reasoning_bonus: float = None,
+    zero_repetition_loops: bool = False,
+):
+    """Outcome reward with optional shaping (v5) and repetition zeroing (v6).
+
+    Defaults (None/None/False) reproduce the original reward exactly:
+    1.0 iff the extracted answer is correct AND ANSWER_START occurs exactly
+    once, else 0.0.
+    """
+    fmt_reward = FORMAT_REWARD if format_reward is None else format_reward
+    rsn_bonus = REASONING_BONUS if reasoning_bonus is None else reasoning_bonus
+
     def reward_func(completions, answer, **kwargs) -> list[float]:
         responses = [completion[0]["content"] for completion in completions]
 
@@ -49,7 +93,18 @@ def get_reward_func(process_answer_func):
         pattern = f"^(?:(?!{escaped_answer_start}).)*{escaped_answer_start}(?:(?!{escaped_answer_start}).)*$"
         matches = [bool(re.search(pattern, r, re.DOTALL)) for r in responses]
 
-        rewards = [1.0 if a and m else 0.0 for a, m in zip(accuracy, matches)]
+        rewards = []
+        for response, a, m in zip(responses, accuracy, matches):
+            reward = 1.0 if a and m else 0.0
+            if m and fmt_reward:
+                reward += fmt_reward
+            if m and rsn_bonus:
+                reasoning_text = response.split(ANSWER_START)[0].strip()
+                if len(reasoning_text) >= _MIN_REASONING_CHARS:
+                    reward += rsn_bonus
+            if zero_repetition_loops and _is_repetition_loop(response):
+                reward = 0.0
+            rewards.append(reward)
 
         print(
             "=" * 50,
@@ -58,7 +113,7 @@ def get_reward_func(process_answer_func):
             "\n" + "=" * 50,
         )
         return rewards
-    
+
     return reward_func
 
 
