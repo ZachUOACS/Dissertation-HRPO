@@ -2,7 +2,8 @@ import types
 from transformers.trainer import *
 
 
-def patch_trainer_optimizer(trainer, lr_thinking_residual_gate=1e-4, thinking_residual_Lambda=1e-3):
+def patch_trainer_optimizer(trainer, lr_thinking_residual_gate=1e-4, thinking_residual_Lambda=1e-3,
+                            lr_thinking_residual_gate_beta=1e-3):
     def create_optimizer(self):
         """
         Setup the optimizer.
@@ -30,8 +31,11 @@ def patch_trainer_optimizer(trainer, lr_thinking_residual_gate=1e-4, thinking_re
                     "weight_decay": 0.0,
                 },
                 {
+                    # gate_r / gate_i (NOT gate_beta - it gets its own, higher LR below so the
+                    # fusion gate can actually open within a run).
                     "params": [
-                        p for n, p in opt_model.named_parameters() if ("thinking_residual_gate" in n and p.requires_grad)
+                        p for n, p in opt_model.named_parameters()
+                        if ("thinking_residual_gate" in n and "gate_beta" not in n and p.requires_grad)
                     ],
                     "lr": lr_thinking_residual_gate,
                     "weight_decay": self.args.weight_decay,
@@ -41,6 +45,16 @@ def patch_trainer_optimizer(trainer, lr_thinking_residual_gate=1e-4, thinking_re
                         p for n, p in opt_model.named_parameters() if ("thinking_residual_Lambda" in n and p.requires_grad)
                     ],
                     "lr": thinking_residual_Lambda,
+                    "weight_decay": self.args.weight_decay,
+                },
+                {
+                    # Change A (fusion): the per-dim beta gate + optional adapter. Higher LR so beta
+                    # can move by O(units) from a near-closed init within the ~934-step run.
+                    "params": [
+                        p for n, p in opt_model.named_parameters()
+                        if ("thinking_residual_gate_beta" in n and p.requires_grad)
+                    ],
+                    "lr": lr_thinking_residual_gate_beta,
                     "weight_decay": self.args.weight_decay,
                 },
             ]

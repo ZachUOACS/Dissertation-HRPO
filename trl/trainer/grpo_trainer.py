@@ -561,8 +561,9 @@ class GRPOTrainer(Trainer):
         else:
             # Regular generation path
             with unwrap_model_for_generation(self.model, self.accelerator) as unwrapped_model:
-                prompt_completion_ids, thinking_embeds, thinking_mask, embeds_ratio = unwrapped_model.generate(
-                    prompt_ids, attention_mask=prompt_mask, 
+                # thinking_hidden (h_I) is None unless fusion (Change A) is enabled on the model.
+                prompt_completion_ids, thinking_embeds, thinking_mask, embeds_ratio, thinking_hidden = unwrapped_model.generate(
+                    prompt_ids, attention_mask=prompt_mask,
                     generation_config=self.generation_config,
                     processing_class=self.processing_class,
                     return_thinking_embeds=True,
@@ -636,14 +637,19 @@ class GRPOTrainer(Trainer):
         # Apply weights to each reward function's output and sum
         rewards = (rewards_per_func * self.reward_weights.to(device).unsqueeze(0)).sum(dim=1)
 
-        # Compute grouped-wise rewards
+        # Compute grouped-wise rewards (std kept for the logged reward_std metric below)
         mean_grouped_rewards = rewards.view(-1, self.num_generations).mean(dim=1)
         std_grouped_rewards = rewards.view(-1, self.num_generations).std(dim=1)
-
-        # Normalize the rewards to compute the advantages
-        mean_grouped_rewards = mean_grouped_rewards.repeat_interleave(self.num_generations, dim=0)
         std_grouped_rewards = std_grouped_rewards.repeat_interleave(self.num_generations, dim=0)
-        advantages = (rewards - mean_grouped_rewards) / (std_grouped_rewards + 1e-4)
+
+        # Change B (Dr. GRPO bias 2 - question-level difficulty bias): dividing by the per-question
+        # reward std up-weights low-variance (too-easy/too-hard) groups. With advantage_std_norm=False
+        # we keep mean-centering only (unbiased; equals RLOO up to a constant scale). A fully tied
+        # group still yields exactly 0 under mean-centering, so no NaN under either setting.
+        from hrpo_ext import compute_group_advantages  # call-time import (rebuild-safe; tested)
+        advantages = compute_group_advantages(
+            rewards, self.num_generations, getattr(self.args, "advantage_std_norm", True),
+        )
 
         # Slice to keep only the local part of the data
         process_slice = slice(
@@ -663,6 +669,18 @@ class GRPOTrainer(Trainer):
 
         self._metrics["reward"].append(rewards.mean().item())
         self._metrics["reward_std"].append(std_grouped_rewards.mean().item())
+
+        # Change B diagnostics: the length-bias signature is incorrect-response length rising while
+        # reward plateaus (Dr. GRPO Fig. 5) - invisible without splitting correct vs incorrect.
+        # Single-GPU jobs: gathered rewards align 1:1 with the local completion_mask.
+        with torch.inference_mode():
+            comp_len = completion_mask.sum(1).float()
+            if comp_len.shape[0] == rewards.shape[0]:
+                is_correct = rewards > 0
+                if is_correct.any():
+                    self._metrics["completion_length_correct"].append(comp_len[is_correct].mean().item())
+                if (~is_correct).any():
+                    self._metrics["completion_length_incorrect"].append(comp_len[~is_correct].mean().item())
 
         if (
             self.log_completions
@@ -690,6 +708,7 @@ class GRPOTrainer(Trainer):
             "completion_mask": completion_mask,
             "thinking_embeds": thinking_embeds,
             "thinking_mask": thinking_mask,
+            "thinking_hidden": thinking_hidden,
             "embeds_ratio": embeds_ratio,
             "ref_per_token_logps": ref_per_token_logps,
             "advantages": advantages,

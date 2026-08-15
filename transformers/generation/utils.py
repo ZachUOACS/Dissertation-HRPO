@@ -3285,6 +3285,20 @@ class GenerationMixin:
 
         is_prefill = True
         is_thinking, last_thinking_states = None, None
+        # Change A (fusion, Option A): carry the previous step's layer-I hidden state h_I forward,
+        # and store it per-position in the rollout buffer (parallel to thinking_embeds/e_pred).
+        # Inert unless fusion is enabled on the inner model.
+        last_hidden_I = None
+        # Robustly locate the inner model's fusion flag (self may be the PEFT/CausalLM wrapper).
+        fusion_on = False
+        _m = self
+        for _ in range(5):
+            if getattr(_m, "fusion_enabled", False):
+                fusion_on = True
+                break
+            _m = getattr(_m, "model", None)
+            if _m is None:
+                break
         thinking_embeds = [self.get_input_embeddings()(input_ids)] if return_thinking_embeds else []
         thinking_mask = [
             torch.zeros_like(input_ids, dtype=torch.bool, device=input_ids.device)
@@ -3292,6 +3306,9 @@ class GenerationMixin:
         embeds_ratio = [
             torch.ones_like(input_ids, dtype=torch.float32, device=input_ids.device)
         ] if return_thinking_embeds else []
+        thinking_hidden = [
+            torch.zeros_like(self.get_input_embeddings()(input_ids))
+        ] if (return_thinking_embeds and fusion_on) else []
         while self._has_unfinished_sequences(this_peer_finished, synced_gpus, device=input_ids.device):
             # prepare model inputs
             model_inputs = self.prepare_inputs_for_generation(input_ids, **model_kwargs)
@@ -3303,6 +3320,7 @@ class GenerationMixin:
             # prepare is_thinking and last_thinking_states for latent reasoning
             model_inputs.update({"is_thinking": is_thinking} if is_thinking is not None else {})
             model_inputs.update({"last_thinking_states": last_thinking_states} if last_thinking_states is not None else {})
+            model_inputs.update({"last_hidden_I": last_hidden_I} if last_hidden_I is not None else {})
 
             if is_prefill:
                 outputs = self(**model_inputs, return_dict=True)
@@ -3371,6 +3389,15 @@ class GenerationMixin:
             )
             last_thinking_states /= torch.sqrt((probs ** 2).sum(-1, keepdim=True)).to(last_thinking_states.dtype)
 
+            # Carry h_I forward for the fusion recurrence. This must happen whenever fusion is on --
+            # at INFERENCE/eval too (return_thinking_embeds=False), not only during training rollout.
+            # Otherwise the fusion arms would silently run as baseline at eval.
+            if fusion_on:
+                if outputs.hidden_states is not None and len(outputs.hidden_states) > 3:
+                    last_hidden_I = outputs.hidden_states[3]
+                else:
+                    last_hidden_I = None
+
             if return_thinking_embeds and outputs.hidden_states is not None:
                 thinking_embeds.append(outputs.hidden_states[0].unsqueeze(1))
                 thinking_mask.append(
@@ -3379,6 +3406,10 @@ class GenerationMixin:
                 embeds_ratio.append(
                     torch.tensor(outputs.hidden_states[2], device=input_ids.device).unsqueeze(1)
                 )
+                if fusion_on:
+                    # Buffer h_I per-position for training replay (aligned 1:1 with thinking_embeds).
+                    hI = last_hidden_I if last_hidden_I is not None else torch.zeros_like(outputs.hidden_states[0])
+                    thinking_hidden.append(hI.unsqueeze(1))
 
             unfinished_sequences = unfinished_sequences & ~stopping_criteria(input_ids, scores)
             this_peer_finished = unfinished_sequences.max() == 0
@@ -3422,7 +3453,19 @@ class GenerationMixin:
                 embeds_ratio.append(
                     torch.ones_like(input_ids[:, -1:], dtype=torch.float32, device=input_ids.device)
                 )
-                return input_ids, torch.cat(thinking_embeds, dim=1), torch.cat(thinking_mask, dim=1), torch.cat(embeds_ratio, dim=1)
+                # 5-tuple: the trailing (non-think) token gets a zero h_I placeholder to stay aligned
+                # with thinking_embeds. thinking_hidden is None when fusion is disabled.
+                thinking_hidden_out = None
+                if fusion_on:
+                    thinking_hidden.append(torch.zeros_like(self.get_input_embeddings()(input_ids[:, -1:])))
+                    thinking_hidden_out = torch.cat(thinking_hidden, dim=1)
+                return (
+                    input_ids,
+                    torch.cat(thinking_embeds, dim=1),
+                    torch.cat(thinking_mask, dim=1),
+                    torch.cat(embeds_ratio, dim=1),
+                    thinking_hidden_out,
+                )
             else:
                 return input_ids
 

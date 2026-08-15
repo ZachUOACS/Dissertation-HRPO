@@ -214,6 +214,32 @@ class GRPOConfig(TrainingArguments):
         default=0.04,
         metadata={"help": "KL coefficient."},
     )
+    # ==== Change B: Dr. GRPO debias flags (defaults reproduce vanilla HRPO/GRPO exactly) ====
+    # Scalar defaults so they survive PatchFastRL's UnslothGRPOConfig rebuild (see rl.py).
+    length_norm: str = field(
+        default="response",
+        metadata={
+            "help": "Per-response loss length normalization. 'response' divides each rollout's loss by "
+            "its own token count |y_i| (vanilla HRPO/GRPO, the Dr. GRPO length bias); 'constant' divides "
+            "by a fixed constant C (Dr. GRPO fix), so every token contributes equally regardless of "
+            "which rollout it came from."
+        },
+    )
+    advantage_std_norm: bool = field(
+        default=True,
+        metadata={
+            "help": "If True, standardize group advantages by the per-question reward std (vanilla "
+            "HRPO/GRPO, the Dr. GRPO difficulty bias). If False, mean-center only: A_i = r_i - mean(r) "
+            "(Dr. GRPO fix; unbiased, equals RLOO up to a constant scale)."
+        },
+    )
+    length_norm_constant: Optional[int] = field(
+        default=None,
+        metadata={
+            "help": "The constant C used when length_norm == 'constant'. If None, defaults to "
+            "max_completion_length (the generation budget / MAX_TOKENS)."
+        },
+    )
     reward_weights: Optional[list[float]] = field(
         default=None,
         metadata={

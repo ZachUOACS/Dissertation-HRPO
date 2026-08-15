@@ -518,6 +518,27 @@ class Qwen2Model(Qwen2PreTrainedModel):
         self.thinking_residual_gate_i = nn.Linear(config.hidden_size, config.hidden_size)
         self.thinking_residual_Lambda = ThinkingResidualLambda(config)
 
+        # ==== Change A: LT-Tuning-style Context-Prediction Fusion (off by default) ====
+        # HRPO's gate currently blends the sampled-token embedding e_hat with the predictive
+        # vocabulary interpolation e_pred (HRPO Eq. 3). Fusion adds a *contextual hidden state*
+        # channel: h_tilde = (1-beta)*e_pred + beta*h_bar_I, where beta is a learned per-dimension
+        # gate (a generalization of LT-Tuning's fixed scalar alpha, not a reimplementation).
+        # The beta gate is named `thinking_residual_gate_*` so it shares the existing gate optimizer
+        # group / learning rate (see patch.py). All flags default to the baseline (fusion disabled).
+        self.thinking_residual_gate_beta = nn.Linear(config.hidden_size, config.hidden_size)
+        with torch.no_grad():
+            # Start at beta ~= 0 so, at init, h_tilde ~= e_pred and the model ~= baseline HRPO.
+            self.thinking_residual_gate_beta.weight.zero_()
+            self.thinking_residual_gate_beta.bias.fill_(-4.0)
+        # Optional adapter (LT-Tuning Eq. 20), built lazily only for untied-embedding models.
+        self.thinking_residual_gate_beta_adapter = None
+        # Fusion configuration (overridden from the CLI in hrpo_*.py). Defaults reproduce baseline.
+        self.fusion_enabled     = False
+        self.fusion_layer_I     = -2       # which hidden layer supplies the context h_I
+        self.fusion_gate_input  = "hidden" # "hidden" (gate on h_I) | "token" (gate on e_hat)
+        self.fusion_normalize_h = True
+        self.fusion_use_adapter = False
+
         # Initialize weights and apply final processing
         self.post_init()
 
@@ -526,6 +547,49 @@ class Qwen2Model(Qwen2PreTrainedModel):
 
     def set_input_embeddings(self, value):
         self.embed_tokens = value
+
+    def reset_fusion_parameters(self, beta_init=-4.0):
+        """Configure the fusion beta gate so beta ~= sigmoid(beta_init) ~= 0 at init.
+
+        With a zeroed weight the gate is input-independent at start (beta = sigmoid(beta_init)),
+        so h_tilde starts ~= e_pred, i.e. ~= baseline HRPO. beta_init = -inf reproduces the
+        baseline exactly (used by the strict-generalization equivalence test)."""
+        with torch.no_grad():
+            self.thinking_residual_gate_beta.weight.zero_()
+            self.thinking_residual_gate_beta.bias.fill_(beta_init)
+
+    def init_fusion_adapter(self, bottleneck_dim=1024):
+        """Build the LT-Tuning Eq. 20 adapter g(h) = W_up @ GELU(W_down @ h).
+
+        Only needed for untied-embedding backbones (e.g. Llama-3.1-8B); Qwen2.5 is tied and
+        does not use it. Must be called BEFORE get_peft_model so the module can be added to
+        modules_to_save. Named under `thinking_residual_gate_*` so it shares the gate optim group."""
+        h = self.config.hidden_size
+        self.thinking_residual_gate_beta_adapter = nn.Sequential(
+            nn.Linear(h, bottleneck_dim),
+            nn.GELU(),
+            nn.Linear(bottleneck_dim, h),
+        ).to(self.thinking_residual_gate_beta.weight.device)
+
+    def fuse_context_prediction(self, e_pred, h_I, e_hat=None, eps=1e-8):
+        """LT-Tuning Context-Prediction Fusion, generalized to a learned per-dimension gate.
+
+        e_pred : predictive vocabulary interpolation (HRPO Eq. 3), already normalized by ||p||.
+        h_I    : raw contextual hidden state at layer I, position t (DETACHED — Option A: stored
+                 from the rollout, symmetric with how HRPO already replays e_pred; no gradient
+                 flows into layer I, only into the beta gate).
+        e_hat  : sampled-token embedding, used only when fusion_gate_input == "token".
+
+        Returns (h_tilde, beta) where h_tilde = (1-beta)*e_pred + beta*h_bar_I. Note beta plays
+        the role of LT-Tuning's alpha (the weight ON the hidden state), NOT (1-alpha)."""
+        from hrpo_ext import context_prediction_fusion  # call-time import (single source of truth)
+        adapter = self.thinking_residual_gate_beta_adapter if self.fusion_use_adapter else None
+        h_tilde, beta = context_prediction_fusion(
+            e_pred, h_I, self.thinking_residual_gate_beta, e_hat=e_hat,
+            gate_input=self.fusion_gate_input, normalize_h=self.fusion_normalize_h,
+            adapter=adapter, eps=eps,
+        )
+        return h_tilde.to(e_pred.dtype), beta
 
     def thinking_residual(self, embeds, residual, eps=1e-8):
         r_t = torch.sigmoid(self.thinking_residual_gate_r(embeds))

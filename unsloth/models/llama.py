@@ -662,9 +662,19 @@ def LlamaModel_fast_forward(
 
     thinking_mask = kwargs.get('thinking_mask')
     if thinking_mask is not None:
+        e_hat_think   = inputs_embeds[thinking_mask]      # sampled-token embedding e_hat
+        residual_think = thinking_embeds[thinking_mask]    # predictive interpolation e_pred (HRPO Eq. 3)
+        # Change A: fuse the contextual hidden state h_I (replayed, detached) into e_pred before
+        # the gate. Off by default -> residual_think stays e_pred -> bit-identical to baseline HRPO.
+        thinking_hidden = kwargs.get('thinking_hidden')
+        if getattr(self, "fusion_enabled", False) and thinking_hidden is not None:
+            residual_think, _beta = self.fuse_context_prediction(
+                residual_think, thinking_hidden[thinking_mask], e_hat=e_hat_think,
+            )
+            self._fusion_beta_mean = _beta.detach().float().mean()
         new_inputs_embeds = inputs_embeds.clone()
         new_inputs_embeds[thinking_mask] = self.thinking_residual(
-            inputs_embeds[thinking_mask], thinking_embeds[thinking_mask],
+            e_hat_think, residual_think,
         )[0].to(inputs_embeds.dtype)
         inputs_embeds = new_inputs_embeds
 
@@ -939,10 +949,18 @@ def LlamaModel_fast_forward_inference(
 
     is_thinking = kwargs.get('is_thinking')
     last_thinking_states = kwargs.get('last_thinking_states')
+    last_hidden_I = kwargs.get('last_hidden_I')
     if is_thinking is not None and last_thinking_states is not None:
-        thinking_embeds = last_thinking_states
+        thinking_embeds = last_thinking_states  # e_pred stored in the rollout buffer (unchanged)
+        residual = last_thinking_states.unsqueeze(1)
+        # Change A: fuse the contextual hidden state h_I from the previous step (Option A) into
+        # e_pred before HRPO's gate. Off by default -> residual stays e_pred -> baseline-identical.
+        if getattr(self.model, "fusion_enabled", False) and last_hidden_I is not None:
+            residual, _ = self.model.fuse_context_prediction(
+                residual, last_hidden_I.unsqueeze(1), e_hat=X,
+            )
         X_hat, a_t = self.model.thinking_residual(
-            X, last_thinking_states.unsqueeze(1),
+            X, residual,
         )
         embeds_ratio = a_t.mean(-1).squeeze()
         embeds_ratio[~torch.tensor(is_thinking)] = 1.
@@ -973,6 +991,13 @@ def LlamaModel_fast_forward_inference(
     pass
 
     next_decoder_cache = []
+
+    # Change A: capture the raw contextual hidden state h_I at layer I (Option A: stored, detached,
+    # replayed from the rollout). Only when fusion is enabled; otherwise this is fully inert.
+    captured_hidden_I = None
+    fusion_layer_I = None
+    if getattr(self.model, "fusion_enabled", False) and is_thinking is not None:
+        fusion_layer_I = self.model.fusion_layer_I % len(self.model.layers)
 
     for idx, decoder_layer in enumerate(self.model.layers):
         residual.copy_(X) # residual = X
@@ -1009,6 +1034,10 @@ def LlamaModel_fast_forward_inference(
         )
         X += residual
 
+        if fusion_layer_I is not None and idx == fusion_layer_I:
+            # h_I_t at the (single) current position; detached snapshot for the rollout buffer.
+            captured_hidden_I = X[:, -1, :].detach().clone()
+
         next_decoder_cache.append(present_key_value)
     pass
     X = fast_rms_layernorm_inference(
@@ -1019,10 +1048,14 @@ def LlamaModel_fast_forward_inference(
         variance = variance,
     )
 
+    thinking_hidden_states = [] if is_thinking is None else [thinking_embeds, is_thinking, embeds_ratio]
+    if captured_hidden_I is not None:
+        thinking_hidden_states.append(captured_hidden_I)  # index 3 = h_I (only when fusion enabled)
+
     return BaseModelOutputWithPast(
         last_hidden_state = X,
         past_key_values = next_decoder_cache,
-        hidden_states = [] if is_thinking is None else [thinking_embeds, is_thinking, embeds_ratio],
+        hidden_states = thinking_hidden_states,
         attentions = [],
     )
 pass
@@ -2476,6 +2509,18 @@ class FastLlamaModel:
                     model.model.model.thinking_residual_Lambda.modules_to_save.default\
                         .to(device = "cuda", dtype = torch.float32, non_blocking = True)
                     model.model.model.thinking_residual_Lambda.modules_to_save.default.requires_grad_(True)
+                # Change A (fusion): the beta gate must be re-enabled here too, or it stays frozen at
+                # init (requires_grad=False -> excluded from the optimizer -> beta never learns).
+                if "thinking_residual_gate_beta" in module and "adapter" not in module:
+                    assert(hasattr(model.model.model.thinking_residual_gate_beta, "modules_to_save"))
+                    model.model.model.thinking_residual_gate_beta.modules_to_save.default\
+                        .to(device = "cuda", dtype = new_dtype, non_blocking = True)
+                    model.model.model.thinking_residual_gate_beta.modules_to_save.default.requires_grad_(True)
+                if "thinking_residual_gate_beta_adapter" in module:
+                    assert(hasattr(model.model.model.thinking_residual_gate_beta_adapter, "modules_to_save"))
+                    model.model.model.thinking_residual_gate_beta_adapter.modules_to_save.default\
+                        .to(device = "cuda", dtype = new_dtype, non_blocking = True)
+                    model.model.model.thinking_residual_gate_beta_adapter.modules_to_save.default.requires_grad_(True)
 
         # Patch tokenizer to pad to the right
         internal_model = model

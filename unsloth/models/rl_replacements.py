@@ -234,7 +234,7 @@ pass
 RL_FUNCTIONS["grpo_trainer"].append(grpo_trainer__get_per_token_logps)
 
 # Custom compiled GRPO loss - creates 3 Triton kernels
-def grpo_compute_loss(old_logits, new_logits, input_ids, mask, beta, advantages):
+def grpo_compute_loss(old_logits, new_logits, input_ids, mask, beta, advantages, length_norm_constant = None):
     # All Unsloth Zoo code licensed under LGPLv3
     old_logits = old_logits.to(torch.float32)
     new_logits = new_logits.to(torch.float32)
@@ -262,11 +262,19 @@ def grpo_compute_loss(old_logits, new_logits, input_ids, mask, beta, advantages)
     mask = mask.to(torch.float32)
     n_mask_per_reward = mask.sum(1)
 
+    # Change B (Dr. GRPO bias 1 - response-level length bias): dividing each rollout's loss by its
+    # own token count |y_i| (= n_mask_per_reward) reweights responses by length. length_norm_constant
+    # (=C) replaces that per-response denominator with a fixed constant so every token contributes
+    # equally. None / <=0 keeps the vanilla per-response behaviour (baseline-identical). NOTE: only
+    # the LOSS denominator changes; the logged metrics below keep the TRUE per-response length.
     # See https://github.com/huggingface/trl/pull/2881
-    loss_per_reward = (loss_i * mask).sum(1) / n_mask_per_reward
+    if length_norm_constant is None or length_norm_constant <= 0:
+        loss_per_reward = (loss_i * mask).sum(1) / n_mask_per_reward
+    else:
+        loss_per_reward = (loss_i * mask).sum(1) / length_norm_constant
     loss = loss_per_reward.mean()  # per-response loss
     # loss = (loss_i * mask).sum() / mask.sum()  # per-token loss
-    
+
     # Get metrics as well which are folded
     with torch.inference_mode():
         completion_length = n_mask_per_reward.mean()
@@ -289,14 +297,14 @@ RL_REPLACEMENTS["grpo_compute_loss_slow"] = \
 class UnslothEfficientGRPO(torch.autograd.Function):
     # All Unsloth Zoo code licensed under LGPLv3
     @staticmethod
-    def forward(ctx, _new_hidden_states, _old_hidden_states, lm_head, _input_ids, _mask, _advantages, beta, scaler = None, n_chunks = 1):
+    def forward(ctx, _new_hidden_states, _old_hidden_states, lm_head, _input_ids, _mask, _advantages, beta, scaler = None, n_chunks = 1, length_norm_constant = None):
         def compute_loss(new_hidden_states, old_hidden_states, input_ids, mask, advantages, scaling):
             new_logits = torch.matmul(new_hidden_states, lm_head.t())
             new_logits = new_logits[:, :-1, :] # exclude the last logit: it corresponds to the next token pred
             old_logits = torch.matmul(old_hidden_states, lm_head.t())
             old_logits = old_logits[:, :-1, :] # exclude the last logit: it corresponds to the next token pred
             loss, completion_length, mean_kl = grpo_compute_loss(
-                old_logits, new_logits, input_ids, mask, beta, advantages,
+                old_logits, new_logits, input_ids, mask, beta, advantages, length_norm_constant,  # Change B
             )
             # Scale loss if needed for mixed precision training
             scaled_loss = loss * scaling
@@ -370,7 +378,9 @@ class UnslothEfficientGRPO(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_output, dcompletion_length, dmean_kl):
         (grad_input,) = ctx.saved_tensors
-        return (grad_input, None, None, None, None, None, None, None, None,)
+        # One None per forward input: _new_hidden_states(grad), _old_hidden_states, lm_head,
+        # _input_ids, _mask, _advantages, beta, scaler, n_chunks, length_norm_constant.
+        return (grad_input, None, None, None, None, None, None, None, None, None,)
     pass
 pass
 RL_REPLACEMENTS["UnslothEfficientGRPO"] = UnslothEfficientGRPO
@@ -386,6 +396,7 @@ def grpo_accumulated_loss(
     completion_mask,
     advantages,
     n_chunks = -1,
+    thinking_hidden = None,
 ):
     # All Unsloth Zoo code licensed under LGPLv3
     bsz, qlen = input_ids.shape
@@ -400,6 +411,14 @@ def grpo_accumulated_loss(
     completion_input_ids = input_ids[:, -logits_to_keep:]
     lm_head = trainer.model.get_output_embeddings().weight
 
+    # Change B: resolve the length-normalization constant C (None -> vanilla per-response length).
+    length_norm_constant = None
+    if getattr(trainer.args, "length_norm", "response") == "constant":
+        length_norm_constant = getattr(trainer.args, "length_norm_constant", None)
+        if length_norm_constant is None:
+            length_norm_constant = trainer.args.max_completion_length  # generation budget = MAX_TOKENS
+        length_norm_constant = float(length_norm_constant)
+
     with torch.amp.autocast(device_type = "cuda", dtype = mixed_dtype):
         with torch.inference_mode(), trainer.accelerator.unwrap_model(trainer.model, keep_fp32_wrapper = False).disable_adapter():
             old_hidden_states = trainer.model(input_ids = input_ids, logits_to_keep = logits_to_keep + 1).logits
@@ -407,13 +426,15 @@ def grpo_accumulated_loss(
 
         if thinking_embeds is not None: thinking_embeds = thinking_embeds.clone()
         if thinking_mask is not None: thinking_mask = thinking_mask.clone()
-        new_hidden_states = trainer.model(input_ids = input_ids, inputs_embeds = thinking_embeds, thinking_mask = thinking_mask, logits_to_keep = logits_to_keep + 1).logits
-        
+        if thinking_hidden is not None: thinking_hidden = thinking_hidden.clone()  # Change A: replayed h_I
+        new_hidden_states = trainer.model(input_ids = input_ids, inputs_embeds = thinking_embeds, thinking_mask = thinking_mask, thinking_hidden = thinking_hidden, logits_to_keep = logits_to_keep + 1).logits
+
         loss, completion_length, mean_kl = UnslothEfficientGRPO.apply(
             new_hidden_states, old_hidden_states, lm_head,
             completion_input_ids, completion_mask, advantages, trainer.beta,
             trainer.accelerator.scaler,
-            n_chunks, 
+            n_chunks,
+            length_norm_constant,
         )
         return loss, completion_length, mean_kl
 
@@ -451,6 +472,7 @@ def grpo_trainer_compute_loss(function_name, function):
         prompt_ids, prompt_mask = inputs["prompt_ids"], inputs["prompt_mask"]
         completion_ids, completion_mask = inputs["completion_ids"], inputs["completion_mask"]
         thinking_embeds, thinking_mask = inputs["thinking_embeds"], inputs["thinking_mask"]
+        thinking_hidden = inputs.get("thinking_hidden")  # Change A: h_I, None unless fusion enabled
         input_ids = torch.cat([prompt_ids, completion_ids], dim=1)
         bsz, qlen = input_ids.shape
         attention_mask = torch.cat([prompt_mask, completion_mask], dim=1)
@@ -473,13 +495,21 @@ def grpo_trainer_compute_loss(function_name, function):
         # loss = ((per_token_loss * completion_mask).sum(dim=1) / completion_mask.sum(dim=1)).mean()
         input_ids = input_ids[:, -logits_to_keep:]
         if per_token_logps is not None:
+            # Change B: resolve C for the (non-default) slow path too.
+            _length_norm_constant = None
+            if getattr(self.args, "length_norm", "response") == "constant":
+                _length_norm_constant = getattr(self.args, "length_norm_constant", None)
+                if _length_norm_constant is None: _length_norm_constant = self.args.max_completion_length
+                _length_norm_constant = float(_length_norm_constant)
             loss, completion_length, mean_kl = grpo_compute_loss_slow(
                 ref_per_token_logps, per_token_logps, input_ids, completion_mask, self.beta, advantages,
+                _length_norm_constant,
             )
         else:
             loss, completion_length, mean_kl = grpo_accumulated_loss(
                 self, _input_ids, _thinking_embeds, thinking_mask, logits_to_keep, completion_mask, advantages,
                 n_chunks = self.args.unsloth_num_chunks,
+                thinking_hidden = thinking_hidden,
             )
 
         # Log the metrics
@@ -493,17 +523,39 @@ def grpo_trainer_compute_loss(function_name, function):
         mean_embeds_ratio = embeds_ratio[embeds_ratio_mask].mean()
         mean_hidden_ratio = torch.sqrt(1 - embeds_ratio[embeds_ratio_mask] ** 2).mean()
 
+        # Change A: mean beta_t over the think span (stashed on the inner model during the fused
+        # forward). None unless fusion is enabled; interactions section wants this per-arm.
+        _fusion_beta = None
+        _inner = self.model
+        for _ in range(6):
+            _bv = getattr(_inner, "_fusion_beta_mean", None)
+            if _bv is not None:
+                _fusion_beta = _bv
+                break
+            _inner = getattr(_inner, "model", None)
+            if _inner is None: break
+
+        # Diagnostic: mean |h_I| of the replayed context buffer. ~0 => the layer-I capture failed
+        # (fusion would be degenerate: gate input 0 => W_beta gets no gradient).
+        _h_I_absmean = None
+        if thinking_hidden is not None:
+            _h_I_absmean = thinking_hidden.detach().float().abs().mean()
+
         if "train" in self._metrics:
             mode = "eval" if self.control.should_evaluate else "train"
             self._metrics[mode]["embeds_ratio"].append(mean_embeds_ratio.item())
             self._metrics[mode]["hidden_ratio"].append(mean_hidden_ratio.item())
             self._metrics[mode]["completion_length"].append(completion_length.item())
             self._metrics[mode]["kl"].append(mean_kl.item())
+            if _fusion_beta is not None: self._metrics[mode]["fusion_beta"].append(_fusion_beta.item())
+            if _h_I_absmean is not None: self._metrics[mode]["h_I_absmean"].append(_h_I_absmean.item())
         else:
             self._metrics["embeds_ratio"].append(mean_embeds_ratio.item())
             self._metrics["hidden_ratio"].append(mean_hidden_ratio.item())
             self._metrics["completion_length"].append(completion_length.item())
             self._metrics["kl"].append(mean_kl.item())
+            if _fusion_beta is not None: self._metrics["fusion_beta"].append(_fusion_beta.item())
+            if _h_I_absmean is not None: self._metrics["h_I_absmean"].append(_h_I_absmean.item())
         return loss
     pass
 

@@ -1,0 +1,336 @@
+<title>Fusion × Debias — GSM8k-1.5B results (3 seeds)</title>
+<style>
+  :root {
+    --bg: #eef0f2;
+    --surface: #ffffff;
+    --panel: #f7f8f9;
+    --grid: #e6eaee;
+    --axis: #c6ccd2;
+    --text: #171b20;
+    --secondary: #565c64;
+    --muted: #8b9198;
+    --hair: #e2e6ea;
+    --c-acc: #2a78d6;   /* accuracy marks (validated slot 1, light) */
+    --c-eff: #1baf7a;   /* effect bars   (validated slot 3, light) */
+    --dot: 58, 64, 70;  /* per-seed dot ink (rgb) */
+    --dot-ring: #ffffff;
+    --font-sans: system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    --font-mono: ui-monospace, "SF Mono", "JetBrains Mono", "Cascadia Code", Menlo, Consolas, monospace;
+    color-scheme: light;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:where(:not([data-theme="light"])) {
+      --bg: #0e1013; --surface: #191c20; --panel: #1e2227; --grid: #2a2e34;
+      --axis: #3a3f46; --text: #eef1f4; --secondary: #a7adb5; --muted: #757b83; --hair: #2b2f35;
+      --c-acc: #3987e5; --c-eff: #2bb184; --dot: 205, 211, 218; --dot-ring: #191c20;
+      color-scheme: dark;
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #0e1013; --surface: #191c20; --panel: #1e2227; --grid: #2a2e34;
+    --axis: #3a3f46; --text: #eef1f4; --secondary: #a7adb5; --muted: #757b83; --hair: #2b2f35;
+    --c-acc: #3987e5; --c-eff: #2bb184; --dot: 205, 211, 218; --dot-ring: #191c20;
+    color-scheme: dark;
+  }
+  :root[data-theme="light"] {
+    --bg: #eef0f2; --surface: #ffffff; --panel: #f7f8f9; --grid: #e6eaee;
+    --axis: #c6ccd2; --text: #171b20; --secondary: #565c64; --muted: #8b9198; --hair: #e2e6ea;
+    --c-acc: #2a78d6; --c-eff: #1baf7a; --dot: 58, 64, 70; --dot-ring: #ffffff;
+    color-scheme: light;
+  }
+
+  * { box-sizing: border-box; }
+  body { margin: 0; }
+  .wrap {
+    background: var(--bg); color: var(--text); font-family: var(--font-sans);
+    min-height: 100vh; display: flex; justify-content: center; align-items: flex-start;
+    padding: clamp(16px, 3vw, 40px);
+  }
+  .slide {
+    background: var(--surface); width: 100%; max-width: 1180px;
+    border: 1px solid var(--hair); border-radius: 14px;
+    padding: clamp(20px, 3vw, 34px);
+    box-shadow: 0 1px 2px rgba(0,0,0,.04), 0 12px 34px rgba(20,30,45,.06);
+    display: flex; flex-direction: column; gap: 20px;
+  }
+
+  header { display: flex; flex-direction: column; gap: 6px; }
+  .eyebrow {
+    font-size: .68rem; letter-spacing: .16em; text-transform: uppercase;
+    color: var(--c-acc); font-weight: 600;
+  }
+  h1 {
+    font-size: clamp(1.3rem, 2.4vw, 1.7rem); margin: 0; font-weight: 650;
+    letter-spacing: -.01em; text-wrap: balance;
+  }
+  .meta {
+    font-family: var(--font-mono); font-size: .74rem; color: var(--secondary);
+    letter-spacing: .01em; margin-top: 2px;
+  }
+  .meta b { color: var(--text); font-weight: 600; }
+
+  .charts { display: grid; grid-template-columns: 1fr 1fr; gap: 22px; }
+  @media (max-width: 760px) { .charts { grid-template-columns: 1fr; } }
+  figure { margin: 0; display: flex; flex-direction: column; gap: 6px; }
+  .fig-head { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; }
+  h2 { font-size: .96rem; margin: 0; font-weight: 620; letter-spacing: -.005em; }
+  .fig-sub { font-family: var(--font-mono); font-size: .68rem; color: var(--muted); }
+  svg { width: 100%; height: auto; display: block; }
+  figcaption { font-size: .7rem; color: var(--muted); line-height: 1.45; }
+
+  /* SVG element roles */
+  .grid-line { stroke: var(--grid); stroke-width: 1; }
+  .axis-line { stroke: var(--axis); stroke-width: 1; }
+  .zero-line { stroke: var(--axis); stroke-width: 1.5; }
+  .tick { font-family: var(--font-mono); font-size: 11px; fill: var(--muted); }
+  .rowlab { font-size: 12.5px; fill: var(--text); font-family: var(--font-sans); }
+  .axis-title { font-size: 11px; fill: var(--secondary); font-family: var(--font-sans); letter-spacing: .02em; }
+  .vallab { font-family: var(--font-mono); font-size: 11.5px; fill: var(--text); font-weight: 600; }
+  .whisker { stroke: var(--c-acc); stroke-width: 1.6; opacity: .85; }
+  .mean-acc { fill: var(--c-acc); }
+  .bar-eff { fill: var(--c-eff); }
+  .seed-dot { fill: rgba(var(--dot), .60); stroke: var(--dot-ring); stroke-width: 1.4; }
+
+  .tables { display: grid; grid-template-columns: 0.92fr 1.08fr; gap: 22px; }
+  @media (max-width: 760px) { .tables { grid-template-columns: 1fr; } }
+  .tbl-block { display: flex; flex-direction: column; gap: 7px; }
+  .tbl-scroll { overflow-x: auto; }
+  table { border-collapse: collapse; width: 100%; font-size: .78rem; }
+  caption { text-align: left; font-size: .96rem; font-weight: 620; margin-bottom: 7px; color: var(--text); }
+  th, td { padding: 5px 9px; text-align: right; white-space: nowrap; }
+  th:first-child, td:first-child { text-align: left; }
+  thead th {
+    font-size: .66rem; text-transform: uppercase; letter-spacing: .06em;
+    color: var(--muted); font-weight: 600; border-bottom: 1px solid var(--axis);
+  }
+  tbody td { font-family: var(--font-mono); color: var(--text); border-bottom: 1px solid var(--hair); }
+  tbody td:first-child { font-family: var(--font-sans); color: var(--secondary); }
+  tbody tr:last-child td { border-bottom: none; }
+  .num { font-variant-numeric: tabular-nums; }
+  .mean-col { color: var(--c-acc) !important; font-weight: 600; }
+  .key-col { font-weight: 600; color: var(--text) !important; }
+  .tbl-note { font-size: .68rem; color: var(--muted); margin: 6px 0 0; line-height: 1.45; }
+  .sig { font-family: var(--font-sans); font-weight: 700; }
+  .foot {
+    font-size: .68rem; color: var(--muted); line-height: 1.5;
+    border-top: 1px solid var(--hair); padding-top: 10px;
+  }
+  .foot code { font-family: var(--font-mono); color: var(--secondary); }
+</style>
+
+<div class="wrap">
+  <div class="slide">
+    <header>
+      <span class="eyebrow">HRPO · 2×2 factorial · 3 seeds</span>
+      <h1>Fusion × Debias on GSM8k-1.5B</h1>
+      <p class="meta">
+        <b>Qwen2.5-1.5B-Instruct</b> · GSM8k test <b>N=1319</b>/seed · HRPO
+        <b>r_min=0.95</b>, β-init −1 · seeds <b>42 / 43 / 44</b> · 934 steps · greedy eval
+      </p>
+    </header>
+
+    <!-- CHARTS -->
+    <div class="charts">
+
+      <!-- Accuracy dot-plot -->
+      <figure>
+        <div class="fig-head">
+          <h2>Accuracy by arm</h2>
+          <span class="fig-sub">mean · ±1 SD · 3 seeds</span>
+        </div>
+        <svg viewBox="0 0 560 300" role="img" aria-label="GSM8k accuracy by arm, mean with standard deviation over three seeds">
+          <!-- vertical gridlines + ticks (68..76) -->
+          <g>
+            <line class="grid-line" x1="150" y1="16" x2="150" y2="246"/>
+            <line class="grid-line" x1="228.5" y1="16" x2="228.5" y2="246"/>
+            <line class="grid-line" x1="307" y1="16" x2="307" y2="246"/>
+            <line class="grid-line" x1="385.5" y1="16" x2="385.5" y2="246"/>
+            <line class="grid-line" x1="464" y1="16" x2="464" y2="246"/>
+            <line class="axis-line" x1="150" y1="246" x2="464" y2="246"/>
+            <text class="tick" x="150" y="262" text-anchor="middle">68</text>
+            <text class="tick" x="228.5" y="262" text-anchor="middle">70</text>
+            <text class="tick" x="307" y="262" text-anchor="middle">72</text>
+            <text class="tick" x="385.5" y="262" text-anchor="middle">74</text>
+            <text class="tick" x="464" y="262" text-anchor="middle">76</text>
+            <text class="axis-title" x="307" y="286" text-anchor="middle">GSM8k accuracy (%)</text>
+          </g>
+
+          <!-- baseline row y=44.75 -->
+          <g>
+            <text class="rowlab" x="142" y="48.7" text-anchor="end">baseline</text>
+            <line class="whisker" x1="226.9" y1="44.75" x2="296.0" y2="44.75"/>
+            <line class="whisker" x1="226.9" y1="39.75" x2="226.9" y2="49.75"/>
+            <line class="whisker" x1="296.0" y1="39.75" x2="296.0" y2="49.75"/>
+            <circle class="seed-dot" cx="293.3" cy="44.75" r="4.3"/>
+            <circle class="seed-dot" cx="266.2" cy="44.75" r="4.3"/>
+            <circle class="seed-dot" cx="224.6" cy="44.75" r="4.3"/>
+            <circle class="mean-acc" cx="261.5" cy="44.75" r="6"/>
+            <text class="vallab" x="474" y="48.7">70.84 ±0.88</text>
+          </g>
+          <!-- debias row y=102.25 -->
+          <g>
+            <text class="rowlab" x="142" y="106.2" text-anchor="end">debias</text>
+            <line class="whisker" x1="316.8" y1="102.25" x2="432.2" y2="102.25"/>
+            <line class="whisker" x1="316.8" y1="97.25" x2="316.8" y2="107.25"/>
+            <line class="whisker" x1="432.2" y1="97.25" x2="432.2" y2="107.25"/>
+            <circle class="seed-dot" cx="406.3" cy="102.25" r="4.3"/>
+            <circle class="seed-dot" cx="409.1" cy="102.25" r="4.3"/>
+            <circle class="seed-dot" cx="307.8" cy="102.25" r="4.3"/>
+            <circle class="mean-acc" cx="374.5" cy="102.25" r="6"/>
+            <text class="vallab" x="474" y="106.2">73.72 ±1.47</text>
+          </g>
+          <!-- fusion row y=159.75 -->
+          <g>
+            <text class="rowlab" x="142" y="163.7" text-anchor="end">fusion</text>
+            <line class="whisker" x1="226.0" y1="159.75" x2="284.6" y2="159.75"/>
+            <line class="whisker" x1="226.0" y1="154.75" x2="226.0" y2="164.75"/>
+            <line class="whisker" x1="284.6" y1="154.75" x2="284.6" y2="164.75"/>
+            <circle class="seed-dot" cx="227.7" cy="159.75" r="4.3"/>
+            <circle class="seed-dot" cx="290.1" cy="159.75" r="4.3"/>
+            <circle class="seed-dot" cx="230.5" cy="159.75" r="4.3"/>
+            <circle class="mean-acc" cx="249.3" cy="159.75" r="6"/>
+            <text class="vallab" x="474" y="163.7">70.53 ±0.90</text>
+          </g>
+          <!-- fusion+debias row y=217.25 -->
+          <g>
+            <text class="rowlab" x="142" y="221.2" text-anchor="end">fusion+debias</text>
+            <line class="whisker" x1="224.2" y1="217.25" x2="387.5" y2="217.25"/>
+            <line class="whisker" x1="224.2" y1="212.25" x2="224.2" y2="222.25"/>
+            <line class="whisker" x1="387.5" y1="212.25" x2="387.5" y2="222.25"/>
+            <circle class="seed-dot" cx="281.1" cy="217.25" r="4.3"/>
+            <circle class="seed-dot" cx="239.5" cy="217.25" r="4.3"/>
+            <circle class="seed-dot" cx="397.3" cy="217.25" r="4.3"/>
+            <circle class="mean-acc" cx="305.8" cy="217.25" r="6"/>
+            <text class="vallab" x="474" y="221.2">71.97 ±2.08</text>
+          </g>
+        </svg>
+        <figcaption>
+          ● filled dot = mean over seeds 42/43/44 · whisker = ±1 SD · ○ small dots = per-seed accuracy.
+          x-axis truncated to 68–76%.
+        </figcaption>
+      </figure>
+
+      <!-- Factorial effects -->
+      <figure>
+        <div class="fig-head">
+          <h2>2×2 factorial effects</h2>
+          <span class="fig-sub">mean ±1 SD · pp</span>
+        </div>
+        <svg viewBox="0 0 560 300" role="img" aria-label="Two-by-two factorial main effects and interaction, in percentage points">
+          <!-- gridlines + ticks (-6..4) -->
+          <g>
+            <line class="grid-line" x1="150" y1="16" x2="150" y2="246"/>
+            <line class="grid-line" x1="218" y1="16" x2="218" y2="246"/>
+            <line class="grid-line" x1="286" y1="16" x2="286" y2="246"/>
+            <line class="grid-line" x1="422" y1="16" x2="422" y2="246"/>
+            <line class="grid-line" x1="490" y1="16" x2="490" y2="246"/>
+            <line class="axis-line" x1="150" y1="246" x2="490" y2="246"/>
+            <line class="zero-line" x1="354" y1="16" x2="354" y2="246"/>
+            <text class="tick" x="150" y="262" text-anchor="middle">−6</text>
+            <text class="tick" x="218" y="262" text-anchor="middle">−4</text>
+            <text class="tick" x="286" y="262" text-anchor="middle">−2</text>
+            <text class="tick" x="354" y="262" text-anchor="middle">0</text>
+            <text class="tick" x="422" y="262" text-anchor="middle">2</text>
+            <text class="tick" x="490" y="262" text-anchor="middle">4</text>
+            <text class="axis-title" x="320" y="286" text-anchor="middle">Effect on accuracy (percentage points)</text>
+          </g>
+
+          <!-- Fusion main y=54.33, mean -1.02 -->
+          <g>
+            <text class="rowlab" x="142" y="58.3" text-anchor="end">Fusion main</text>
+            <rect class="bar-eff" x="319.3" y="42.3" width="34.7" height="24" rx="3"/>
+            <circle class="seed-dot" cx="271.4" cy="54.33" r="4.3"/>
+            <circle class="seed-dot" cx="290.8" cy="54.33" r="4.3"/>
+            <circle class="seed-dot" cx="395.1" cy="54.33" r="4.3"/>
+            <text class="vallab" x="555" y="58.3" text-anchor="end">−1.02 ±1.96</text>
+          </g>
+          <!-- Debias main y=131, mean +2.16 -->
+          <g>
+            <text class="rowlab" x="142" y="135" text-anchor="end">Debias main</text>
+            <rect class="bar-eff" x="354" y="119" width="73.4" height="24" rx="3"/>
+            <circle class="seed-dot" cx="426.1" cy="131" r="4.3"/>
+            <circle class="seed-dot" cx="394.1" cy="131" r="4.3"/>
+            <circle class="seed-dot" cx="462.1" cy="131" r="4.3"/>
+            <text class="vallab" x="555" y="135" text-anchor="end">+2.16 ±1.01</text>
+          </g>
+          <!-- Interaction y=207.67, mean -1.44 -->
+          <g>
+            <text class="rowlab" x="142" y="211.6" text-anchor="end">Interaction</text>
+            <rect class="bar-eff" x="305.0" y="195.67" width="49.0" height="24" rx="3"/>
+            <circle class="seed-dot" cx="302.3" cy="207.67" r="4.3"/>
+            <circle class="seed-dot" cx="186.4" cy="207.67" r="4.3"/>
+            <circle class="seed-dot" cx="426.1" cy="207.67" r="4.3"/>
+            <text class="vallab" x="555" y="211.6" text-anchor="end">−1.44 ±3.53</text>
+          </g>
+        </svg>
+        <figcaption>
+          Bar = mean effect over 3 seeds (from 0) · ○ small dots = per-seed effect.
+          Fusion = ½[(F−B)+(FD−D)]; Debias = ½[(D−B)+(FD−F)]; Interaction = FD−(F+D−B).
+        </figcaption>
+      </figure>
+    </div>
+
+    <!-- TABLES -->
+    <div class="tables">
+      <div class="tbl-block tbl-scroll">
+        <table>
+          <caption>Accuracy per seed (%)</caption>
+          <thead>
+            <tr><th>Arm</th><th>s42</th><th>s43</th><th>s44</th><th>Mean ± SD</th></tr>
+          </thead>
+          <tbody>
+            <tr><td>baseline</td><td class="num">71.65</td><td class="num">70.96</td><td class="num">69.90</td><td class="num mean-col">70.84 ± 0.88</td></tr>
+            <tr><td>debias</td><td class="num">74.53</td><td class="num">74.60</td><td class="num">72.02</td><td class="num mean-col">73.72 ± 1.47</td></tr>
+            <tr><td>fusion</td><td class="num">69.98</td><td class="num">71.57</td><td class="num">70.05</td><td class="num mean-col">70.53 ± 0.90</td></tr>
+            <tr><td>fusion+debias</td><td class="num">71.34</td><td class="num">70.28</td><td class="num">74.30</td><td class="num mean-col">71.97 ± 2.08</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="tbl-block tbl-scroll">
+        <table>
+          <caption>Pooled McNemar across 3 seeds</caption>
+          <thead>
+            <tr><th>Contrast (A vs B)</th><th>Δ̄ (pp)</th><th>Σb</th><th>Σc</th><th>p</th><th>&nbsp;</th></tr>
+          </thead>
+          <tbody>
+            <tr><td>debias vs baseline</td><td class="num">+2.88</td><td class="num">408</td><td class="num">294</td><td class="num">1.9e−05</td><td class="sig">***</td></tr>
+            <tr><td>fusion vs baseline</td><td class="num">−0.30</td><td class="num">311</td><td class="num">323</td><td class="num">0.66</td><td class="sig">ns</td></tr>
+            <tr><td>fusion+debias vs baseline</td><td class="num">+1.14</td><td class="num">361</td><td class="num">316</td><td class="num">0.091</td><td class="sig">ns</td></tr>
+            <tr><td>fusion+debias vs debias</td><td class="num">−1.74</td><td class="num">308</td><td class="num">377</td><td class="num">0.0093</td><td class="sig">**</td></tr>
+            <tr><td>fusion vs fusion+debias</td><td class="num">−1.44</td><td class="num">351</td><td class="num">408</td><td class="num">0.042</td><td class="sig">*</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+    <!-- LENGTH -->
+    <div class="tbl-block tbl-scroll length">
+      <table>
+        <caption>Completion-length growth over training (early → late, tokens)</caption>
+        <thead>
+          <tr>
+            <th>Seed</th><th>base Δcor</th><th>base Δinc</th>
+            <th>debias Δcor</th><th>debias Δinc</th><th>Δinc (debias−base)</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr><td>42</td><td class="num">+1</td><td class="num">+65</td><td class="num">+54</td><td class="num">+124</td><td class="num key-col">+59</td></tr>
+          <tr><td>43</td><td class="num">+8</td><td class="num">+43</td><td class="num">+52</td><td class="num">+112</td><td class="num key-col">+69</td></tr>
+          <tr><td>44</td><td class="num">+9</td><td class="num">+57</td><td class="num">+21</td><td class="num">+73</td><td class="num key-col">+16</td></tr>
+        </tbody>
+      </table>
+      <p class="tbl-note">
+        Δ = mean completion length over last 15% − first 15% of training (discrete tokens), split by
+        whether the response was correct/incorrect. Dr. GRPO predicts debias Δincorrect ≤ baseline; observed
+        debias &gt; baseline in all 3 seeds.
+      </p>
+    </div>
+
+    <p class="foot">
+      <code>b</code> = A correct &amp; B wrong, <code>c</code> = A wrong &amp; B correct, summed over the
+      three seeds (qid-aligned). <code>Δ̄</code> = mean per-seed accuracy difference. McNemar exact,
+      two-sided. Significance: <b>***</b> p&lt;.001 · <b>**</b> p&lt;.01 · <b>*</b> p&lt;.05 · <b>ns</b> p≥.05.
+    </p>
+  </div>
+</div>

@@ -1,7 +1,35 @@
+import os
 import re
 import string
 
 ANSWER_START = "####"
+
+
+def resolve_model_path(model_name):
+    """Resolve an HF repo id to a LOCAL cache snapshot dir so unsloth loads fully offline.
+
+    unsloth's loader does a network `HfFileSystem.glob(...)` unless `model_name` is a local
+    directory, which fails under HF_HUB_OFFLINE on the air-gapped compute node. It also remaps
+    `Qwen/...` -> `unsloth/...`, so we try that cached repo first. Returns
+    `(name_or_path, use_exact_model_name)`; falls back to the original name (online/proxy path)
+    if nothing is cached, so it can only help, never break the existing loading.
+    """
+    if os.path.isdir(model_name):
+        return model_name, True
+    try:
+        from huggingface_hub import snapshot_download
+    except Exception:
+        return model_name, False
+    candidates = []
+    if "/" in model_name and not model_name.startswith("unsloth/"):
+        candidates.append("unsloth/" + model_name.split("/", 1)[1])  # unsloth's remapped upload
+    candidates.append(model_name)
+    for repo in candidates:
+        try:
+            return snapshot_download(repo, local_files_only=True), True
+        except Exception:
+            continue
+    return model_name, False
 
 SYSTEM_PROMPT = (
     "A conversation between User and Assistant. The user asks a question, and "
