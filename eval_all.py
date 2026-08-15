@@ -31,13 +31,15 @@ import torch
 
 from eval_gsm8k import evaluate_model
 from stats_utils import wilson_ci, mcnemar_test
-from variant_common import MODEL_NAMES, VARIANT_CHAIN, GATE_MODES
+from variant_common import (MODEL_NAMES, VARIANT_CHAIN, GATE_MODES,
+                            parse_experiment_name)
 
 FULL_TEST_SIZE = 1319
 
-SIZES = ["0.5b", "1.5b", "3b"]
+# Scope the study to a subset of sizes with HRPO_SIZES (space-separated), e.g.
+# HRPO_SIZES=1.5b to report 1.5B only. Defaults to every size.
+SIZES = os.environ.get("HRPO_SIZES", "0.5b 1.5b 3b").split()
 
-VARIANT_DIR_RE = re.compile(r"^(0\.5b|1\.5b|3b)-(v\d_[a-z_]+)$")
 LEGACY_DIR_RE = re.compile(r"^Qwen2\.5-(0\.5B|1\.5B|3B)-Instruct-gsm8k-.*$")
 
 
@@ -46,10 +48,16 @@ LEGACY_DIR_RE = re.compile(r"^Qwen2\.5-(0\.5B|1\.5B|3B)-Instruct-gsm8k-.*$")
 # ---------------------------------------------------------------------------
 
 def final_checkpoint(exp_dir: str):
+    """Highest-step checkpoint holding either trainable weights (needed to run
+    an evaluation) or an existing eval_results.json (enough to rebuild the
+    comparison table). Accepting the latter lets `--skip_eval` regenerate the
+    table on a machine that has only the small analysis files synced, instead
+    of silently dropping every run whose adapter is not present locally."""
     ckpts = []
     for d in glob.glob(os.path.join(exp_dir, "checkpoint-*")):
         m = re.match(r"checkpoint-(\d+)$", os.path.basename(d))
-        if m and os.path.exists(os.path.join(d, "adapter_model.safetensors")):
+        if m and (os.path.exists(os.path.join(d, "adapter_model.safetensors"))
+                  or os.path.exists(os.path.join(d, "eval_results.json"))):
             ckpts.append((int(m.group(1)), d))
     return max(ckpts)[1] if ckpts else None
 
@@ -78,17 +86,23 @@ def discover_experiments():
         ckpt = final_checkpoint(exp_dir)
         if ckpt is None:
             continue
-        m = VARIANT_DIR_RE.match(name)
-        if m:
-            size, variant = m.group(1), m.group(2)
+        parsed = parse_experiment_name(name)
+        if parsed:
+            size, base_variant, suffix = parsed
             found.append({
                 "model_size": size,
-                "variant_id": variant,
+                # Reported id keeps the suffix so replicates/controls are
+                # distinguishable rows ...
+                "variant_id": base_variant + suffix,
+                "base_variant": base_variant,
                 "exp_dir": exp_dir,
                 "checkpoint": ckpt,
-                "gate_mode": GATE_MODES.get(variant, "standard"),
+                # ... but the gate configuration MUST come from the base
+                # variant, or a follow-up run is evaluated with the wrong
+                # gate mode and its accuracy is meaningless.
+                "gate_mode": GATE_MODES.get(base_variant, "standard"),
                 "temperature": get_run_temperature(exp_dir),
-                "in_chain": variant in VARIANT_CHAIN,
+                "in_chain": base_variant in VARIANT_CHAIN and not suffix,
             })
             continue
         m = LEGACY_DIR_RE.match(name)
@@ -122,9 +136,28 @@ def eval_is_complete(path: str, expected_total: int) -> bool:
 # ---------------------------------------------------------------------------
 
 def run_missing_evals(runs, batch_size, num_samples, sizes_present):
+    """Evaluate everything still missing. Each model is evaluated inside its
+    own try/except: a failure (e.g. a base model that will not download) is
+    recorded and the remaining evaluations still run, so one bad model cannot
+    cost a whole GPU allocation. Failures are re-reported at the end."""
     expected_total = num_samples if num_samples else FULL_TEST_SIZE
+    failures = []
 
-    # Base models zero-shot (reference rows).
+    def attempt(label, **kwargs):
+        try:
+            evaluate_model(**kwargs)
+            return True
+        except Exception as exc:                      # noqa: BLE001
+            print(f"[FAIL] {label}: {type(exc).__name__}: {exc}")
+            failures.append((label, f"{type(exc).__name__}: {exc}"))
+            return False
+        finally:
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+    # Base models zero-shot (reference rows — not part of the ablation chain,
+    # so a failure here must never block the trained-checkpoint evals).
     os.makedirs("results/base_model_evals", exist_ok=True)
     for size in sizes_present:
         save_path = f"results/base_model_evals/{size}_base.json"
@@ -132,7 +165,8 @@ def run_missing_evals(runs, batch_size, num_samples, sizes_present):
             print(f"[skip] base {size} ({save_path} complete)")
             continue
         print(f"[eval] base zero-shot {size} (gate disabled)")
-        evaluate_model(
+        attempt(
+            f"base {size}",
             model_path=MODEL_NAMES[size],
             adapter_path=None,
             temperature=0.5,
@@ -143,10 +177,8 @@ def run_missing_evals(runs, batch_size, num_samples, sizes_present):
             gate_mode="disabled",
             save_path=save_path,
         )
-        gc.collect()
-        torch.cuda.empty_cache()
 
-    # Trained checkpoints.
+    # Trained checkpoints (the dissertation results).
     for run in runs:
         save_path = os.path.join(run["checkpoint"], "eval_results.json")
         if eval_is_complete(save_path, expected_total):
@@ -155,7 +187,8 @@ def run_missing_evals(runs, batch_size, num_samples, sizes_present):
         print(f"[eval] {run['model_size']}-{run['variant_id']} "
               f"({run['checkpoint']}, gate_mode={run['gate_mode']}, "
               f"temp={run['temperature']})")
-        evaluate_model(
+        attempt(
+            f"{run['model_size']}-{run['variant_id']}",
             model_path=MODEL_NAMES[run["model_size"]],
             adapter_path=run["checkpoint"],
             temperature=run["temperature"],
@@ -166,8 +199,13 @@ def run_missing_evals(runs, batch_size, num_samples, sizes_present):
             gate_mode=run["gate_mode"],
             save_path=save_path,
         )
-        gc.collect()
-        torch.cuda.empty_cache()
+
+    if failures:
+        print(f"\n{len(failures)} evaluation(s) FAILED (the rest completed; "
+              f"re-run eval_all.py to retry just these):")
+        for label, err in failures:
+            print(f"  - {label}: {err}")
+    return failures
 
 
 # ---------------------------------------------------------------------------
@@ -302,16 +340,25 @@ def main():
                         help="Evaluate a subset (smoke runs only; full = 1319)")
     parser.add_argument("--skip_eval", action="store_true",
                         help="Only rebuild the comparison table")
+    parser.add_argument("--sizes", nargs="+", default=None, choices=SIZES,
+                        help="Restrict to these model sizes (default: all "
+                             "discovered). Use to skip a size whose base model "
+                             "is unavailable, e.g. --sizes 1.5b 3b")
+    parser.add_argument("--skip_base", action="store_true",
+                        help="Skip the base-model zero-shot reference evals")
     args = parser.parse_args()
 
     runs = discover_experiments()
+    if args.sizes:
+        runs = [r for r in runs if r["model_size"] in args.sizes]
     print(f"Discovered {len(runs)} evaluable experiments:")
     for r in runs:
         print(f"  {r['model_size']:>5} {r['variant_id']:<40} {r['checkpoint']}")
 
     sizes_present = sorted({r["model_size"] for r in runs}, key=SIZES.index)
     if not args.skip_eval:
-        run_missing_evals(runs, args.batch_size, args.num_samples, sizes_present)
+        run_missing_evals(runs, args.batch_size, args.num_samples,
+                          [] if args.skip_base else sizes_present)
 
     table = build_table(runs, args.num_samples)
     save_and_print(table)

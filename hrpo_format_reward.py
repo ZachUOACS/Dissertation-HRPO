@@ -17,6 +17,7 @@ from datasets import load_dataset, Dataset
 from patch import patch_trainer_optimizer
 from utils import *
 from variant_common import (
+    train_with_resume, LORA_TARGETS,
     MODEL_NAMES, GATE_MODULES, build_arg_parser, experiment_dir,
     exit_if_complete, assert_optimizer_gate_params,
     set_rollout_repetition_penalty, GateGradientLogger, RunLogger,
@@ -34,7 +35,7 @@ def preprocess_gsm8k(split="train", chunk_size=1000) -> Dataset:
 
 
 def main(args):
-    exp_name = experiment_dir(args.model_size, VARIANT_ID)
+    exp_name = experiment_dir(args.model_size, VARIANT_ID, args)
     exit_if_complete(exp_name)
     model_name = MODEL_NAMES[args.model_size]
 
@@ -53,10 +54,7 @@ def main(args):
     model = FastLanguageModel.get_peft_model(
         model,
         r = args.lora_rank,
-        target_modules = [
-            "q_proj", "k_proj", "v_proj", "o_proj",
-            "gate_proj", "up_proj", "down_proj",
-        ],
+        target_modules = LORA_TARGETS[args.lora_targets],
         # v5: full HRPO gate, as in v4.
         modules_to_save = list(GATE_MODULES),
         lora_alpha = args.lora_rank * 2,
@@ -116,7 +114,7 @@ def main(args):
     trainer.add_callback(GateGradientLogger(trainer.model, exp_name))
 
     run_logger = RunLogger(exp_name, VARIANT_ID, args.model_size, args)
-    trainer.train()
+    train_with_resume(trainer, exp_name, args)
     run_logger.finish(trainer)
 
 

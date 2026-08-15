@@ -73,7 +73,20 @@ run_one() {
     local size="$1" v="$2"
     local variant_id="${VARIANT_IDS[$v]}"
     local script="${SCRIPTS[$v]}"
-    local exp_dir="experiments/${size}-${variant_id}"
+    # Derive the experiment directory the SAME way the training script will
+    # (variant_common.experiment_dir), so that follow-up runs carrying extra
+    # args — --seed / --repetition_penalty / --lora_targets — resolve to their
+    # own suffixed directory. Using the bare "{size}-{variant}" here would make
+    # every such run skip against the completed main-ablation run.
+    local exp_dir
+    exp_dir=$("$PYTHON" - "$size" "$variant_id" "${EXTRA_ARGS[@]:-}" <<'PYEOF'
+import sys
+from variant_common import build_arg_parser, experiment_dir
+size, variant_id, extra = sys.argv[1], sys.argv[2], [a for a in sys.argv[3:] if a]
+args = build_arg_parser(variant_id).parse_args(["--model_size", size] + extra)
+print(experiment_dir(size, variant_id, args).lstrip("./"))
+PYEOF
+)
 
     if "$PYTHON" -c "import sys; from variant_common import experiment_is_complete; sys.exit(0 if experiment_is_complete('$exp_dir') else 1)"; then
         echo ">>> SKIP ${size}-${variant_id} (completed checkpoint exists)"

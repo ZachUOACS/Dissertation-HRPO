@@ -20,6 +20,10 @@ export HF_HOME=/data/ztay632/.cache/huggingface
 export https_proxy=http://squid.auckland.ac.nz:3128
 export http_proxy=http://squid.auckland.ac.nz:3128
 export TORCHDYNAMO_DISABLE=1
+# Unbuffered stdout: otherwise Python block-buffers when writing to a file and
+# a job cancelled before its first flush leaves an empty .log (tqdm goes to
+# stderr, so only the .err would have content).
+export PYTHONUNBUFFERED=1
 # wandb: cluster account is logged in, so jobs log online (project
 # "latent-reasoning", set by the variant scripts). If the proxy ever blocks
 # it, export WANDB_MODE=offline before submitting and `wandb sync` later —
@@ -33,11 +37,16 @@ source .venv/bin/activate
 : "${VARIANT_NUM:?Set VARIANT_NUM via --export (1..6)}"
 
 echo "=== $(date -Is) job ${SLURM_JOB_ID:-?} v${VARIANT_NUM} @ ${MODEL_SIZE} on $(hostname) ==="
+echo "logs: $(scontrol show job "${SLURM_JOB_ID:-0}" 2>/dev/null | grep -E 'StdOut|StdErr' | tr -s ' ')"
 nvidia-smi --query-gpu=name,memory.total --format=csv,noheader || true
 
 # run_ablations.sh handles: variant -> script mapping, skip-if-complete,
 # and merging start/end time + peak GPU memory into training_log.json
 # (flock-guarded, safe under concurrent jobs).
-./run_ablations.sh --model_size "$MODEL_SIZE" --variant "v${VARIANT_NUM}"
+# EXTRA_ARGS (optional, propagated via sbatch --export=ALL) carries follow-up
+# run overrides such as "--seed 43" or "--repetition_penalty 1.0 --lora_targets
+# attention". Unquoted on purpose so it word-splits into separate arguments.
+echo "extra args: ${EXTRA_ARGS:-<none>}"
+./run_ablations.sh --model_size "$MODEL_SIZE" --variant "v${VARIANT_NUM}" -- ${EXTRA_ARGS:-}
 
 echo "=== $(date -Is) done (exit $?) ==="

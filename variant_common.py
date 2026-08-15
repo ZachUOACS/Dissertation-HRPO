@@ -15,6 +15,7 @@ import datetime
 import glob
 import json
 import os
+import re
 import time
 import types
 
@@ -64,6 +65,10 @@ def build_arg_parser(variant_id: str) -> argparse.ArgumentParser:
     parser.add_argument("--model_size", type=str, default="1.5b",
                         choices=sorted(MODEL_NAMES.keys()))
     parser.add_argument("--lora_rank", type=int, default=32)
+    parser.add_argument("--lora_targets", type=str, default="full",
+                        choices=sorted(LORA_TARGETS.keys()),
+                        help="full = attention+MLP (main ablation); "
+                             "attention = q/k/v/o only, matching HRPO paper Table 4")
 
     parser.add_argument("--lr", type=float, default=5e-6)
     parser.add_argument("--beta", type=float, default=0.005)
@@ -77,12 +82,20 @@ def build_arg_parser(variant_id: str) -> argparse.ArgumentParser:
     parser.add_argument("--optimizer", type=str, default="paged_adamw_8bit")
     parser.add_argument("--max_grad_norm", type=float, default=0.1)
 
+    # HRPO paper Table 4/5 (Yue et al. 2025), GSM8k row:
+    #   group size 4, grad-accum 4, TOTAL train batch 32 -> per_device 8
+    #   (total = per_device x grad_accum), prompt/completion 512 / 512.
+    # The dissertation spec's Section 5 listed per_device 4 and 1024/1024,
+    # which cost 4x per completion (each optimizer step makes grad_accum
+    # generate() calls regardless of batch size, so 1024-token decodes double
+    # the step time while a batch of 4 halves the completions produced) and
+    # mismatched eval_gsm8k.py's 512-token decode. Paper values used.
     parser.add_argument("--group_size", type=int, default=4)
     parser.add_argument("--temperature", type=float, default=0.5)
     parser.add_argument("--gradient_accumulation_steps", type=int, default=4)
-    parser.add_argument("--per_device_train_batch_size", type=int, default=4)
-    parser.add_argument("--max_prompt_length", type=int, default=1024)
-    parser.add_argument("--max_completion_length", type=int, default=1024)
+    parser.add_argument("--per_device_train_batch_size", type=int, default=8)
+    parser.add_argument("--max_prompt_length", type=int, default=512)
+    parser.add_argument("--max_completion_length", type=int, default=512)
     # Rollout-sampling repetition penalty (Section 5). Set 1.0 to disable
     # (that reproduces the pre-existing 1.5b-v1_grpo_baseline checkpoint).
     parser.add_argument("--repetition_penalty", type=float, default=1.2)
@@ -96,8 +109,53 @@ def build_arg_parser(variant_id: str) -> argparse.ArgumentParser:
 # Experiment directory handling
 # ---------------------------------------------------------------------------
 
-def experiment_dir(model_size: str, variant_id: str) -> str:
-    return f"./experiments/{model_size}-{variant_id}"
+# LoRA target sets. "full" is what the main ablation used; "attention" matches
+# the HRPO paper's Table 4 ("query, key, value, dense"), used by the faithful
+# reproduction run.
+LORA_TARGETS = {
+    "full": ["q_proj", "k_proj", "v_proj", "o_proj",
+             "gate_proj", "up_proj", "down_proj"],
+    "attention": ["q_proj", "k_proj", "v_proj", "o_proj"],
+}
+
+
+def experiment_dir(model_size: str, variant_id: str, args=None) -> str:
+    """experiments/{size}-{variant}, plus a suffix for any follow-up run that
+    departs from the main ablation's configuration.
+
+    Without the suffix a seed-43 replicate would resolve to the seed-42
+    directory, hit exit_if_complete() and silently do nothing.
+    """
+    name = f"{model_size}-{variant_id}"
+    if args is not None:
+        if getattr(args, "seed", 42) != 42:
+            name += f"-seed{args.seed}"
+        if getattr(args, "repetition_penalty", 1.2) != 1.2:
+            name += f"-rp{args.repetition_penalty:g}"
+        if getattr(args, "lora_targets", "full") != "full":
+            name += f"-lora{args.lora_targets}"
+    return f"./experiments/{name}"
+
+
+# experiments/{size}-{base_variant}[-suffix], where suffix marks a follow-up
+# run (-seed43, -rp1, -loraattention, or a combination).
+EXPERIMENT_NAME_RE = re.compile(
+    r"^(?P<size>0\.5b|1\.5b|3b)-(?P<variant>v\d_[a-z_]+?)(?P<suffix>-(?:seed|rp|lora).*)?$"
+)
+
+
+def parse_experiment_name(name: str):
+    """('1.5b-v3_learned_lambda-seed43') -> ('1.5b', 'v3_learned_lambda',
+    '-seed43'), or None if the directory is not an ablation experiment.
+
+    Analysis code must key gate mode / chain position off the BASE variant
+    while still reporting the suffix, otherwise follow-up runs are either
+    ignored entirely or mis-evaluated with the wrong gate configuration.
+    """
+    m = EXPERIMENT_NAME_RE.match(name)
+    if not m:
+        return None
+    return m.group("size"), m.group("variant"), (m.group("suffix") or "")
 
 
 def experiment_is_complete(exp_dir: str) -> bool:
@@ -119,9 +177,76 @@ def exit_if_complete(exp_dir: str):
     if experiment_is_complete(exp_dir):
         print(f"Experiment {exp_dir} already has a completed checkpoint. Exiting...")
         raise SystemExit(0)
-    if os.path.exists(exp_dir) and len(os.listdir(exp_dir)) > 0:
-        print(f"WARNING: {exp_dir} exists but is incomplete; the Trainer will "
-              f"write fresh checkpoints into it.")
+
+
+def latest_checkpoint(exp_dir: str):
+    """Highest-step checkpoint in exp_dir, or None. Used to resume a run that
+    was cut short (e.g. killed at the SLURM wall-time limit) instead of
+    restarting it from scratch."""
+    candidates = []
+    for path in glob.glob(os.path.join(exp_dir, "checkpoint-*")):
+        m = re.match(r"checkpoint-(\d+)$", os.path.basename(path))
+        if m and os.path.exists(os.path.join(path, "trainer_state.json")):
+            candidates.append((int(m.group(1)), path))
+    return max(candidates)[1] if candidates else None
+
+
+# Hyperparameters that must not change across a resume: a checkpoint trained
+# with different values cannot be continued without silently mixing configs.
+_CONFIG_FINGERPRINT = [
+    "model_size", "lora_rank", "lr", "beta", "seed",
+    "residual_r_min", "residual_r_max", "group_size", "temperature",
+    "gradient_accumulation_steps", "per_device_train_batch_size",
+    "max_prompt_length", "max_completion_length", "repetition_penalty",
+    "lora_targets",
+]
+
+
+def train_with_resume(trainer, exp_dir: str, args):
+    """trainer.train(), resuming from the newest checkpoint if one exists.
+    Checkpoints are written every save_steps=250, so a job killed at the SLURM
+    wall-time limit loses at most 250 steps when resubmitted.
+
+    Refuses to resume a checkpoint whose run_config.json disagrees with the
+    current hyperparameters — e.g. a partial run from before the switch to the
+    HRPO paper's per_device 8 / 512-token config. Resuming across a config
+    change would mix hyperparameters mid-run and invalidate the variant."""
+    os.makedirs(exp_dir, exist_ok=True)
+    config_path = os.path.join(exp_dir, "run_config.json")
+    current = {k: getattr(args, k) for k in _CONFIG_FINGERPRINT if hasattr(args, k)}
+
+    resume = latest_checkpoint(exp_dir)
+    if resume:
+        stored = None
+        if os.path.exists(config_path):
+            try:
+                with open(config_path) as f:
+                    stored = json.load(f)
+            except (json.JSONDecodeError, OSError):
+                stored = None
+        diffs = []
+        if stored is None:
+            diffs = ["run_config.json missing (checkpoint predates this guard)"]
+        else:
+            for key, value in current.items():
+                if stored.get(key) != value:
+                    diffs.append(f"{key}: checkpoint={stored.get(key)!r} now={value!r}")
+        if diffs:
+            raise SystemExit(
+                f"\nREFUSING TO RESUME {resume}\n"
+                f"Its hyperparameters differ from the current run:\n  "
+                + "\n  ".join(diffs)
+                + f"\n\nResuming would mix configs mid-run. Delete the stale "
+                  f"experiment directory and start fresh:\n"
+                  f"  rm -rf {exp_dir}\n")
+        print(f"Resuming training from {resume} (config matches)")
+    else:
+        print(f"No checkpoint in {exp_dir}; starting from scratch")
+
+    with open(config_path, "w") as f:
+        json.dump(current, f, indent=2)
+
+    trainer.train(resume_from_checkpoint=resume)
 
 
 # ---------------------------------------------------------------------------
@@ -232,8 +357,18 @@ def set_rollout_repetition_penalty(trainer, repetition_penalty: float):
 
 class GateGradientLogger(TrainerCallback):
     """Appends per-optimizer-step gradient L2 norms of the gate parameters to
-    <exp_dir>/gradient_log.jsonl. Fires on_pre_optimizer_step, i.e. after
-    gradient accumulation, before clipping and the optimizer step."""
+    <exp_dir>/gradient_log.jsonl (attached for v3-v6; v1/v2 have no trainable
+    gate parameters, so there is nothing to log).
+
+    Fires on_pre_optimizer_step, which HF Trainer calls AFTER gradient
+    accumulation and AFTER clip_grad_norm_ (transformers/trainer.py:2589 vs
+    :2605) — so the recorded norms are POST-clipping. Clipping rescales every
+    gradient by one common factor, so Lambda-vs-gate ratios (the quantity the
+    Task 4 gradient-flow analysis asks about) are exact; absolute magnitudes
+    are scaled down whenever clipping is active (visible as the LoRA norm
+    pinning at max_grad_norm). analyse_gate.gradient_flow() reconstructs the
+    pre-clip magnitudes using the pre-clip total norm that the Trainer records
+    as `grad_norm` in trainer_state.json."""
 
     def __init__(self, model, exp_dir: str, every: int = 1):
         self.exp_dir = exp_dir

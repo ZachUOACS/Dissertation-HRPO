@@ -8,7 +8,7 @@ their saved eval_results.json (single greedy decode each; no re-generation).
 Outputs:
   results/failure_analysis.json      — confusion matrix, error sub-categories,
                                        difficulty-proxy accuracies (Wilson CIs)
-  results/failure_examples/*.md      — first 20 "GRPO only correct" examples
+  results/failure_examples/<tag>/*.md — first 20 "GRPO only correct" examples
   results/plots/failure_categories_<tag>.png
   results/plots/failure_difficulty_<tag>.png
 
@@ -25,6 +25,7 @@ import re
 
 from utils import ANSWER_START, _is_repetition_loop
 from stats_utils import wilson_ci
+from variant_common import parse_experiment_name
 
 import numpy as np
 from plot_style import apply_style, variant_color, variant_label, PALETTE
@@ -47,12 +48,25 @@ def load_eval(checkpoint: str):
 
 
 def infer_tag(checkpoint: str) -> str:
-    """experiments/1.5b-v4_full_hrpo_gate/checkpoint-1868 -> 1.5b-v4_full_hrpo_gate"""
+    """experiments/1.5b-v4_full_hrpo_gate/checkpoint-1868 -> 1.5b-v4_full_hrpo_gate
+
+    A follow-up suffix (-rp1, -seed43, -loraattention) is stripped so the output
+    figures/keys are setting-agnostic: running this on the corrected rp=1.0
+    checkpoints therefore OVERWRITES the identically-named rp=1.2 figures rather
+    than leaving both behind. (Which setting produced them is a pipeline choice,
+    not something encoded in the filename.)
+    """
     parts = os.path.normpath(checkpoint).split(os.sep)
+    dirname = "unknown"
     for p in reversed(parts):
         if not p.startswith("checkpoint-"):
-            return p
-    return "unknown"
+            dirname = p
+            break
+    parsed = parse_experiment_name(dirname)
+    if parsed:
+        size, base_variant, _suffix = parsed
+        return f"{size}-{base_variant}"
+    return dirname
 
 
 def infer_variant(tag: str) -> str:
@@ -190,7 +204,11 @@ def main():
         difficulty[grp] = entry
 
     # ---- qualitative examples: GRPO only correct --------------------------
-    examples_dir = os.path.join(args.out_dir, "failure_examples")
+    # One sub-directory per comparison: the pipeline runs this script four
+    # times (v4/v6 vs v1, at 1.5b and 3b) and a flat directory would mix the
+    # comparisons together (and collide whenever two pairs share a rank and
+    # question index).
+    examples_dir = os.path.join(args.out_dir, "failure_examples", tag)
     os.makedirs(examples_dir, exist_ok=True)
     for rank, i in enumerate(groups["grpo_only_correct"][:args.n_examples]):
         h, g = hrpo_results[i], grpo_results[i]

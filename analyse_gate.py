@@ -39,11 +39,12 @@ from safetensors.torch import load_file
 
 from stats_utils import wilson_ci  # noqa: F401 (re-exported for report use)
 from plot_style import apply_style, variant_color, variant_label
-from variant_common import MODEL_NAMES, VARIANT_CHAIN, GATE_MODES
+from variant_common import (MODEL_NAMES, VARIANT_CHAIN, GATE_MODES,
+                            parse_experiment_name)
 
 plt = apply_style()
 
-SIZES = ["0.5b", "1.5b", "3b"]
+SIZES = os.environ.get("HRPO_SIZES", "0.5b 1.5b 3b").split()
 RESULTS_JSON = "results/gate_analysis.json"
 PLOTS_DIR = "results/plots"
 
@@ -62,13 +63,37 @@ def lambda_to_ratio(lam: np.ndarray) -> np.ndarray:
     return np.sqrt(np.clip(1.0 - a ** 2, 0.0, 1.0))
 
 
+# Which experiment setting the gate analysis reads. "" = the main ablation
+# (rp=1.2) cells, keyed by base_variant+suffix as before. Set to a suffix such
+# as "-rp1" (via --variant_suffix) to run the *same* analysis on the corrected
+# rp=1.0 checkpoints: dirs carrying exactly that suffix are keyed by their BARE
+# variant, so every plot below (all of which look up bare (size, variant))
+# transparently reads the rp=1.0 run and overwrites the identically-named figure.
+TARGET_SUFFIX = ""
+
+
 def find_experiments():
-    """{(size, variant_id): exp_dir} for spec-named experiment dirs."""
+    """{(size, variant_id): exp_dir} for spec-named experiment dirs.
+
+    With TARGET_SUFFIX set (e.g. "-rp1"), only the dirs whose suffix matches are
+    included, keyed by the bare variant — so `experiments[(size, "v4_full_hrpo_gate")]`
+    resolves to `1.5b-v4_full_hrpo_gate-rp1`, and the whole analysis runs at rp=1.0
+    without touching any plot function.
+    """
     out = {}
     for exp_dir in sorted(glob.glob("experiments/*")):
-        m = re.match(r"^(0\.5b|1\.5b|3b)-(v\d_[a-z_]+)$", os.path.basename(exp_dir))
-        if m:
-            out[(m.group(1), m.group(2))] = exp_dir
+        parsed = parse_experiment_name(os.path.basename(exp_dir))
+        if not parsed:
+            continue
+        size, base_variant, suffix = parsed
+        if TARGET_SUFFIX:
+            if suffix == TARGET_SUFFIX:
+                out[(size, base_variant)] = exp_dir
+        else:
+            # Static/dynamic gate analyses compare the main ablation cells;
+            # follow-up runs (suffixed) are keyed separately so they never
+            # silently overwrite a main-ablation entry.
+            out[(size, base_variant + suffix)] = exp_dir
     return out
 
 
@@ -92,6 +117,12 @@ def load_history(exp_dir):
     """(steps, hidden_ratio, reward) arrays from the final checkpoint's
     trainer_state.json log_history."""
     ckpt = final_checkpoint(exp_dir)
+    if ckpt is None:
+        # No local checkpoint (e.g. only the summary was synced back from the
+        # cluster). Callers treat this as "skip this experiment"; without the
+        # explicit raise the None reaches os.path.join as a TypeError and kills
+        # the whole report run.
+        raise FileNotFoundError(f"no checkpoint with adapter weights in {exp_dir}")
     with open(os.path.join(ckpt, "trainer_state.json")) as f:
         history = json.load(f)["log_history"]
     steps, ratios, rewards = [], [], []
@@ -143,9 +174,16 @@ def update_results(section: str, payload):
         except json.JSONDecodeError:
             data = {}
     data[section] = payload
+    # Section keys deliberately strip the run suffix so re-running at a
+    # different setting overwrites the same figures/keys — which leaves the
+    # numbers themselves setting-agnostic. Record which checkpoints produced
+    # each section ('' = rp=1.2 main cells, '-rp1' = corrected setting) so the
+    # report can tell a fresh rp=1.0 section from a leftover rp=1.2 one.
+    data.setdefault("_source_suffix", {})[section] = TARGET_SUFFIX
     with open(RESULTS_JSON, "w") as f:
         json.dump(data, f, indent=2)
-    print(f"[gate_analysis.json] updated section '{section}'")
+    print(f"[gate_analysis.json] updated section '{section}' "
+          f"(source suffix '{TARGET_SUFFIX}')")
 
 
 # ---------------------------------------------------------------------------
@@ -309,7 +347,11 @@ def plot6_reward_vs_ratio(experiments, size="1.5b", variant="v4_full_hrpo_gate")
     if not exp_dir:
         print(f"[plot6] {size}-{variant} not found; skipped")
         return None
-    steps, ratios, rewards = load_history(exp_dir)
+    try:
+        steps, ratios, rewards = load_history(exp_dir)
+    except (FileNotFoundError, KeyError):
+        print(f"[plot6] no usable history in {exp_dir}; skipped")
+        return None
     good = np.isfinite(ratios) & np.isfinite(rewards)
     ratios, rewards, steps = ratios[good], rewards[good], steps[good]
     if len(ratios) < 20:
@@ -341,8 +383,38 @@ def plot6_reward_vs_ratio(experiments, size="1.5b", variant="v4_full_hrpo_gate")
             "n_steps": int(len(ratios))}
 
 
+def unclip_scales(exp_dir, steps, max_grad_norm=0.1):
+    """The gradient log is written after clip_grad_norm_ (see
+    variant_common.GateGradientLogger). Clipping multiplies every gradient by
+    c = min(1, max_grad_norm / total_norm_preclip), and the Trainer records
+    total_norm_preclip as `grad_norm` in trainer_state.json. Dividing a logged
+    norm by c recovers its pre-clip magnitude. Returns {step: c}."""
+    try:
+        ckpt = final_checkpoint(exp_dir)
+        with open(os.path.join(ckpt, "trainer_state.json")) as f:
+            history = json.load(f)["log_history"]
+    except (FileNotFoundError, KeyError, TypeError):
+        return {}
+    summary_path = os.path.join(exp_dir, "train_summary.json")
+    if os.path.exists(summary_path):
+        try:
+            with open(summary_path) as f:
+                max_grad_norm = json.load(f)["args"].get("max_grad_norm", max_grad_norm)
+        except (json.JSONDecodeError, KeyError, OSError):
+            pass
+    scales = {}
+    for h in history:
+        gn = h.get("grad_norm")
+        if gn:
+            scales[h["step"]] = min(1.0, max_grad_norm / gn)
+    return scales
+
+
 def gradient_flow(experiments, size="1.5b"):
-    """|grad Lambda| vs |grad gate_r/gate_i| from gradient_log.jsonl (v3/v4)."""
+    """|grad Lambda| vs |grad gate_r/gate_i| from gradient_log.jsonl (v3-v6).
+
+    v1/v2 have no trainable gate parameters and therefore no gradient log —
+    that is expected, not a missing run."""
     payload = {}
     fig, axes = plt.subplots(1, 2, figsize=(8.2, 3.2), sharey=True)
     plotted = False
@@ -357,17 +429,34 @@ def gradient_flow(experiments, size="1.5b"):
             continue
         records = [json.loads(l) for l in open(log_path)]
         steps = [r["step"] for r in records]
-        summary = {}
+        scales = unclip_scales(exp_dir, steps)
+        summary = {"note": "norms logged post-clipping; ratios are exact, "
+                           "absolute magnitudes additionally reported pre-clip"}
         for key, color in (("Lambda", variant_color("v3_learned_lambda")),
                            ("gate_r", variant_color("v4_full_hrpo_gate")),
                            ("gate_i", variant_color("v6_hrpo_full"))):
             vals = np.array([r[key] if r[key] is not None else np.nan
                              for r in records], dtype=float)
             if np.isfinite(vals).any():
-                ax.semilogy(steps, ema(np.nan_to_num(vals, nan=0.0), 0.05),
+                preclip = np.array([
+                    (r[key] / scales[r["step"]])
+                    if (r[key] is not None and scales.get(r["step"])) else np.nan
+                    for r in records], dtype=float)
+                # PLOT THE PRE-CLIP NORMS. Post-clip norms are not comparable
+                # ACROSS runs — each run has its own clipping factor
+                # c = min(1, max_grad_norm / total_norm), so a post-clip figure
+                # shows a v3-vs-v4 Lambda ratio (~3.4x) that contradicts the
+                # true ratio (8.7x) quoted in the text. Within a single panel
+                # the gate-to-Lambda ratio is unaffected by clipping either way.
+                series = preclip if np.isfinite(preclip).any() else vals
+                ax.semilogy(steps, ema(np.nan_to_num(series, nan=0.0), 0.05),
                             color=color, label=f"|grad {key}|")
-                summary[key] = {"mean": float(np.nanmean(vals)),
-                                "median": float(np.nanmedian(vals))}
+                summary[key] = {
+                    "mean": float(np.nanmean(vals)),
+                    "median": float(np.nanmedian(vals)),
+                    "mean_preclip": (float(np.nanmean(preclip))
+                                     if np.isfinite(preclip).any() else None),
+                }
             else:
                 summary[key] = None
         if summary.get("Lambda") and summary.get("gate_r"):
@@ -378,8 +467,10 @@ def gradient_flow(experiments, size="1.5b"):
         payload[variant] = summary
         ax.legend(fontsize=7.5)
         plotted = True
-    axes[0].set_ylabel("gradient L2 norm (log)")
-    fig.suptitle(f"Gradient flow: Λ vs input gates ({size})", fontsize=10)
+    axes[0].set_ylabel("pre-clip gradient L2 norm (log)")
+    fig.suptitle(f"Gradient flow: Λ vs input gates ({size})\n"
+                 f"norms reconstructed to pre-clipping scale (see text)",
+                 fontsize=10)
     if plotted:
         path = os.path.join(PLOTS_DIR, f"gate_gradient_flow_{size}.png")
         fig.savefig(path)
@@ -649,34 +740,50 @@ def plot8_heatmaps(size, n_questions, batch_size):
     vmax = 0.0
     rows_per_q = []
     payload = {}
+    N_COLS = 200          # common width: x is POSITION AS FRACTION OF RESPONSE
     for qi in range(n_questions):
         rows = []
         for variant, _ in pair:
             rec = per_variant[variant][qi]
-            rows.append(rec["hidden_ratio"][:rec["think_end"]])
-        width = max((len(r) for r in rows), default=1)
-        mat = np.full((2, max(width, 1)), np.nan)
+            rows.append(np.asarray(rec["hidden_ratio"][:rec["think_end"]],
+                                   dtype=float))
+        # Resample every row to the same width. Raw token counts differ between
+        # variants, so a ragged image invites the reader to compare BAR LENGTHS
+        # (which encode only response length) instead of COLOUR (the actual
+        # measurement). Equal-width rows make length carry no signal.
+        mat = np.full((2, N_COLS), np.nan)
         for ri, r in enumerate(rows):
-            mat[ri, :len(r)] = r
+            if len(r) == 0:
+                continue
+            if len(r) == 1:
+                mat[ri, :] = r[0]
+            else:
+                mat[ri, :] = np.interp(np.linspace(0, 1, N_COLS),
+                                       np.linspace(0, 1, len(r)), r)
         vmax = max(vmax, np.nanmax(mat) if np.isfinite(mat).any() else 0.0)
         rows_per_q.append(mat)
         payload[f"q{qi}"] = {
             variant: {"std_within": round(float(np.std(r)), 5) if len(r) else None,
                       "mean": round(float(np.mean(r)), 5) if len(r) else None,
-                      "n_tokens": int(len(r))}
+                      "n_tokens": int(len(r)),
+                      # Persist the per-token series so this figure can be
+                      # restyled later without re-running generation on a GPU.
+                      "per_token_hidden_ratio": [round(float(x), 6) for x in r]}
             for (variant, _), r in zip(pair, rows)}
     for qi, (ax, mat) in enumerate(zip(axes, rows_per_q)):
         im = ax.imshow(mat, aspect="auto", cmap="Blues", vmin=0.0,
                        vmax=max(vmax, 1e-6), interpolation="nearest")
         ax.set_yticks([0, 1])
         ax.set_yticklabels([variant_label(v) for v, _ in pair], fontsize=7)
-        ax.set_xticks([])
+        ax.set_xticks([0, N_COLS - 1])
+        ax.set_xticklabels(["start", "end of think span"], fontsize=6)
         ax.grid(False)
         ax.set_title(f"Q{qi + 1}: {questions[qi][:88]}...", fontsize=7, loc="left")
     cb = fig.colorbar(im, ax=axes, fraction=0.02, pad=0.02)
     cb.set_label("per-token hidden ratio", fontsize=8)
-    fig.suptitle(f"Per-token gate activation: v2 (frozen Λ) vs v4 (full gate), {size}",
-                 fontsize=10, y=1.02)
+    fig.suptitle(f"Per-token gate activation: v2 (frozen Λ) vs v4 (full gate), {size}\n"
+                 f"rows resampled to equal width; UNIFORM COLOUR WITHIN A ROW "
+                 f"IS THE FINDING", fontsize=9, y=1.03)
     path = os.path.join(PLOTS_DIR, f"gate_p8_activation_heatmap_{size}.png")
     fig.savefig(path)
     plt.close(fig)
@@ -784,7 +891,17 @@ def main():
     parser.add_argument("--variance_questions", type=int, default=20)
     parser.add_argument("--variance_samples", type=int, default=4)
     parser.add_argument("--batch_size", type=int, default=8)
+    parser.add_argument("--variant_suffix", type=str, default="",
+                        help="Experiment-dir suffix to analyse instead of the "
+                             "main ablation cells, e.g. '-rp1' to run the whole "
+                             "gate analysis on the corrected rp=1.0 checkpoints. "
+                             "Figures overwrite the identically-named main ones.")
     args = parser.parse_args()
+    global TARGET_SUFFIX
+    TARGET_SUFFIX = args.variant_suffix
+    if TARGET_SUFFIX:
+        print(f"[analyse_gate] reading '{TARGET_SUFFIX}' checkpoints "
+              f"(bare-variant keyed); figures will reflect that setting.")
     if not args.static and not args.dynamic:
         args.static = True
     if args.static:
