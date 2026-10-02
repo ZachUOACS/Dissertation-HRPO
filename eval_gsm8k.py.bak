@@ -1,0 +1,253 @@
+import unsloth
+from unsloth import FastLanguageModel
+
+import os
+import json
+import torch
+from datetime import datetime
+from datasets import load_dataset
+from transformers import GenerationConfig
+from tqdm import tqdm
+
+from utils import *
+
+
+def evaluate_model(
+    model_path: str,
+    adapter_path: str,
+    temperature: float,
+    is_inference: bool,
+    batch_size: int = 4,
+    num_samples: int = None,
+    save_results: bool = True,
+    gate_mode: str = "standard",
+    save_path: str = None,
+    task: str = "gsm8k",
+):
+    """gate_mode selects the gate configuration used at inference and must
+    mirror how the checkpoint was trained (see changes.md mapping #7):
+      - "standard": stock HRPO gate (v4/v5/v6 and the legacy checkpoints);
+      - "unit":     r_t = i_t = 1 via the unit-gate patch (v2/v3);
+      - "constant": unit gates AND the Eq.3 projection replaced by the learned
+                    vector u (v7 / tier-8 arm C1). Without this, a C1
+                    checkpoint would be evaluated with the projection it was
+                    never trained with and its accuracy would be meaningless;
+      - "disabled": no hybrid blending at all (v1 and base zero-shot —
+                    without an HRPO-trained adapter the gate weights are
+                    random and must not run).
+    adapter_path=None evaluates the base model zero-shot (save_path required
+    if save_results). Defaults reproduce the original behaviour exactly.
+    """
+    model, tokenizer = FastLanguageModel.from_pretrained(
+        model_name = model_path,
+        # MATH decodes 1024 new tokens on top of the prompt; 1024 total
+        # would truncate. (eval_math.py uses 1536 for the same reason.)
+        max_seq_length = 1536 if task == "math" else 1024,
+        load_in_4bit = False,
+        fast_inference = False,
+    )
+    model.answer_start = ANSWER_START
+    tokenizer.padding_side = "left"
+    tokenizer.pad_token = tokenizer.eos_token
+
+    u_init = None
+    if gate_mode == "constant":
+        # u must exist on thinking_residual_Lambda BEFORE the adapter is loaded,
+        # exactly as in training (register_constant_latent_vector precedes
+        # get_peft_model). Register it afterwards and the checkpoint's u has no
+        # parameter to land in: it is dropped, u stays at its init, and the run
+        # is evaluated with a vector it never trained. Keep the init value so
+        # the load can be verified below.
+        from variant_common import register_constant_latent_vector, get_inner_model
+        register_constant_latent_vector(model)
+        u_init = get_inner_model(model).thinking_residual_Lambda.u.detach().clone()
+
+    if adapter_path is not None:
+        model.load_adapter(adapter_path)
+    if gate_mode == "disabled":
+        model.answer_start = ""
+    elif gate_mode == "unit":
+        from variant_common import apply_unit_gate_patch
+        apply_unit_gate_patch(model)
+    elif gate_mode == "constant":
+        from variant_common import apply_constant_latent_patch, get_inner_model
+        apply_constant_latent_patch(model)
+        if adapter_path is not None:
+            # A silently-dropped u is the failure this whole branch exists to
+            # prevent, and it is invisible in the accuracy number — so make it
+            # loud. Training moves u (it sits in Lambda's 1e-3 group), so a
+            # bit-identical u means the checkpoint's value never arrived.
+            u_now = get_inner_model(model).thinking_residual_Lambda.u.detach()
+            if torch.equal(u_now, u_init.to(u_now.device)):
+                raise RuntimeError(
+                    f"gate_mode='constant': u is bit-identical to its init after "
+                    f"loading {adapter_path} — the checkpoint's learned u was not "
+                    f"applied, so this evaluation would use the wrong latent "
+                    f"vector. Check that the adapter carries a "
+                    f"'thinking_residual_Lambda...u' key.")
+    elif gate_mode != "standard":
+        raise ValueError(f"Unknown gate_mode: {gate_mode}")
+    model = FastLanguageModel.for_inference(model)
+
+    # Task spec. GSM8K and MATH share the system prompt, the "####" answer
+    # marker and extract_from_response; they differ only in the split, the field
+    # holding the gold answer, how that field becomes a comparable answer, and
+    # the decode budget (MATH solutions are longer).
+    if task == "gsm8k":
+        dataset = load_dataset('openai/gsm8k', 'main')['test']
+        q_key, a_key, max_new = 'question', 'answer', 512
+        answer_fn = process_gsm8k_answer
+        gold_fn = lambda gold: process_gsm8k_answer(extract_hash_answer(gold))
+    elif task == "math":
+        # MATH-500 (or a local MATH test split): 'problem' + boxed 'solution'.
+        dataset = load_math500()
+        q_key, a_key, max_new = 'problem', 'solution', 1024
+        answer_fn = process_math_answer
+        gold_fn = lambda gold: process_math_answer(extract_boxed_answer(gold) or "")
+    else:
+        raise ValueError(f"unknown task {task!r}; expected 'gsm8k' or 'math'")
+    if num_samples and len(dataset) > num_samples:
+        dataset = dataset.shuffle(seed=42).select(range(num_samples))
+    total_samples = len(dataset)
+    print(f"Loaded {total_samples} samples")
+
+    results = []
+    correct = 0
+    total = 0
+
+    progress_bar = tqdm(
+        total=total_samples,
+        desc="Processing samples",
+        unit="examples",
+        dynamic_ncols=True,
+    )
+    progress_bar.set_postfix({'acc': '0.00%', 'correct': '0'})
+
+    # Process samples in batches
+    for i in range(0, total_samples, batch_size):
+        batch_data = dataset[i:i + batch_size]
+        current_batch_size = len(batch_data[q_key])
+
+        # Prepare prompts using the same format as training
+        prompts = [
+            [
+                {'role': 'system', 'content': SYSTEM_PROMPT},
+                {'role': 'user', 'content': q.strip()},
+            ]
+            for q in batch_data[q_key]
+        ]
+
+        # Convert chat prompts to the required format
+        formatted_prompts = [
+            tokenizer.apply_chat_template(
+                p,
+                tokenize=False,
+                add_generation_prompt=True
+            )
+            for p in prompts
+        ]
+
+        prompt_inputs = tokenizer(
+            formatted_prompts, return_tensors="pt", padding=True, padding_side="left", add_special_tokens=False
+        )
+        prompt_ids, prompt_mask = prompt_inputs["input_ids"], prompt_inputs["attention_mask"]
+        prompt_ids = prompt_ids.to(model.device)
+        prompt_mask = prompt_mask.to(model.device)
+        prompt_length = prompt_ids.size(1)
+
+        # Generate responses
+        outputs = model.generate(
+            prompt_ids, attention_mask=prompt_mask, 
+            generation_config=GenerationConfig(
+                do_sample=True,  # for temperature, top-k, etc.
+                temperature=temperature,
+                max_new_tokens=max_new,
+            ),
+            processing_class=tokenizer,
+            is_inference=is_inference,
+        )
+
+        # Process each generated response
+        for j, output in enumerate(outputs):
+            response = tokenizer.decode(output[prompt_length:])
+            response = response.split(
+                tokenizer.special_tokens_map['eos_token']
+            )[0]
+
+            # Extract the generated answer using XML tags
+            extracted = extract_from_response(response)
+            generated_answer = answer_fn(extracted)
+            true_answer = gold_fn(batch_data[a_key][j])
+            print(generated_answer, true_answer, generated_answer == true_answer)
+
+            # Store the result
+            result = {
+                'question': batch_data[q_key][j],
+                'true_answer': true_answer,
+                'generated_answer': generated_answer,
+                'full_response': response,
+                'correct': generated_answer == true_answer
+            }
+            results.append(result)
+
+            if generated_answer == true_answer:
+                correct += 1
+            total += 1
+
+        progress_bar.update(current_batch_size)
+        progress_bar.set_postfix({
+            'acc': f'{(correct/total)*100:.2f}%',
+            'correct': f'{correct}/{total}',
+        })
+
+    progress_bar.close()
+    accuracy = correct / total if total > 0 else 0
+    metrics = {
+        'accuracy': accuracy,
+        'correct': correct,
+        'total': total,
+        'model_path': adapter_path,
+        'base_model': model_path,
+        'gate_mode': gate_mode,
+        'task': task,
+        'timestamp': datetime.now().isoformat()
+    }
+
+    if save_results:
+        if save_path is None:
+            save_path = adapter_path + "/eval_results.json"
+        with open(save_path, 'w') as f:
+            json.dump({'metrics': metrics, 'results': results}, f, indent=2)
+        print(f"\nResults saved to {save_path}")
+
+    return metrics
+
+
+if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--greedy", type=bool, default=True)
+    parser.add_argument("--batch_size", type=int, default=32)
+    parser.add_argument("--checkpoint_path", type=str, default=None)
+    args = parser.parse_args()
+
+    base_model = None
+    checkpoint_path = args.checkpoint_path
+    base_models = ["Qwen/Qwen2.5-1.5B-Instruct", "Qwen/Qwen2.5-3B-Instruct"]
+    for model in base_models:
+        if model.split('/')[-1] in checkpoint_path:
+            base_model = model
+    temperature = float(checkpoint_path.split('-temp')[-1].split('/')[0])
+    print(checkpoint_path, base_model, temperature)
+
+    if 'eval_results.json' not in os.listdir(checkpoint_path):
+        print(f"Starting GSM8k evaluation on {checkpoint_path}")
+        metrics = evaluate_model(
+            model_path=base_model,
+            adapter_path=checkpoint_path,
+            temperature=temperature,
+            is_inference=args.greedy,
+            batch_size=args.batch_size,
+            num_samples=None,
+            save_results=True,
+        )

@@ -1,0 +1,1992 @@
+# changes.md — HRPO Dissertation Ablation Work Log
+
+Running log of every change, per Section 15 of the task specification. Entries are
+append-only; reversals get a new entry.
+
+---
+
+### [2026-07-13 01:10] Section 2 repo mapping (no code changed)
+
+**File(s):** none (read-only survey)
+
+**Change:** Completed the required reading (HRPO paper §3.1/§3.2, `patch.py`, `utils.py`,
+`hrpo_gsm8k.py`, `eval_gsm8k.py`, `hrpo_overhead.py`) and the repo mapping. Findings recorded
+here verbatim so later entries can reference them.
+
+**Repo mapping results:**
+
+1. **Gate parameter definitions.** NOT under `unsloth/models/` as the spec assumed — they live
+   in the *vendored transformers* package:
+   - `transformers/models/qwen2/modeling_qwen2.py:517-519` — `Qwen2Model.__init__` defines
+     `self.thinking_residual_gate_r = nn.Linear(hidden, hidden)`,
+     `self.thinking_residual_gate_i = nn.Linear(hidden, hidden)`,
+     `self.thinking_residual_Lambda = ThinkingResidualLambda(config)`.
+   - `transformers/models/qwen2/modeling_qwen2.py:469-489` — `ThinkingResidualLambda`
+     (`c = 8.0`, `Lambda = nn.Parameter(torch.randn(hidden))`).
+   - A parallel copy exists in `transformers/models/llama/modeling_llama.py` (Llama backbones,
+     unused for this Qwen-only study).
+
+2. **`reset_lambda_parameters`.** Defined at `modeling_qwen2.py:476-483`; accepts
+   `r_min=0.9, r_max=0.999`. It draws `u ~ U[r_min, r_max]` and sets
+   `Lambda = -log(u^(-1/c) - 1)`. Call site: `hrpo_gsm8k.py:57-59`
+   (`model.model.model.thinking_residual_Lambda.reset_lambda_parameters(...)`), called AFTER
+   `get_peft_model`. Verified in peft 0.14 source
+   (`peft/utils/other.py`, `ModulesToSaveWrapper.__getattr__`) that this attribute access
+   forwards to the **active adapter copy** (`modules_to_save["default"]`), so the *trained*
+   Lambda copy is the one being initialised. The `original_module` keeps `randn` init but is
+   inactive while the adapter is enabled.
+
+3. **Sign convention differs from the paper.** The forward is
+   `a_t = exp(-c * softplus(-Lambda) * r_t)` (`modeling_qwen2.py:485-489`) — note
+   `softplus(-Λ)`, not `softplus(Λ)` as in paper Eq. 4. With the init above this still yields
+   `a_t(r_t=1) ~ U[r_min, r_max]`. All analysis code (Task 4 Plot 2/3) must therefore use
+   `a = exp(-8·softplus(-Λ))`, NOT the spec's literal `exp(-8·softplus(Λ))`.
+
+4. **Equation 4 blend (gate) call sites.**
+   - Module method: `Qwen2Model.thinking_residual` at `modeling_qwen2.py:530-534`:
+     `r_t = σ(gate_r(e)); i_t = σ(gate_i(e)); a_t = Λ(r_t);
+     return a_t*e + sqrt(1-a_t²+eps)*(i_t*h), a_t`.
+   - Training forward: `unsloth/models/llama.py:663-669` (`LlamaModel_fast_forward`; blends
+     `inputs_embeds[thinking_mask]` with `thinking_embeds[thinking_mask]`).
+   - Incremental decode: `unsloth/models/llama.py:940-949`
+     (`LlamaModel_fast_forward_inference`; also emits `embeds_ratio = a_t.mean(-1)`, set to 1.0
+     for non-think tokens; returned through `hidden_states=[thinking_embeds, is_thinking,
+     embeds_ratio]` at `llama.py:1025`).
+
+5. **Equation 3 projection call site.** `transformers/generation/utils.py:3367-3372` inside the
+   patched `GenerationMixin._sample`:
+   `last_thinking_states = einsum('bv,vd->bd', probs, W_e) / sqrt(sum(probs²))`, with
+   `probs = softmax(logits_processor(...))` — the generation temperature IS the Eq. 3 τ.
+   Think-span detection: `is_thinking = [model.answer_start not in decoded_completion]`
+   (`utils.py:3368`), i.e. the span ends at the first `####`. `is_inference=True` switches
+   token *selection* to argmax (`utils.py:3352-3356`) while the projection still uses the
+   temperature-softmaxed distribution — this is why `eval_gsm8k.py` passes the training
+   temperature parsed from the checkpoint path even for greedy eval.
+
+6. **`modules_to_save` handling.** Passed at `hrpo_gsm8k.py:48-52` with all three gate modules.
+   `unsloth/models/llama.py:2336-2350` validates entries (only `lm_head`, `embed_tokens`,
+   `thinking_residual*` allowed); `llama.py:2457-2478` then, per module present, casts the
+   adapter copy to float32 and sets `requires_grad_(True)` **individually per gate module** —
+   so passing only `thinking_residual_Lambda` (variant v3) is supported by the existing code.
+
+7. **v3 feasibility check (spec §6 question).** Omitting `gate_r`/`gate_i` from
+   `modules_to_save` is **NOT sufficient** to fix `r_t = i_t = 1`. Those `nn.Linear` layers are
+   not in the pretrained Qwen checkpoint, so `from_pretrained` leaves them randomly initialised
+   (σ(random·e) ≈ 0.5, not 1) and they still execute inside
+   `Qwen2Model.thinking_residual`. Fixing `r_t = i_t = 1` therefore requires bypassing the
+   gate computation. Chosen mechanism (implemented later, see subsequent entries): an
+   instance-level override of `Qwen2Model.thinking_residual` that computes
+   `a_t = Λ(ones)` and blends `a_t·e + sqrt(1-a_t²+eps)·h` — identical maths to the module
+   method with `r_t = i_t = 1`. This must be applied at **both training and evaluation** time
+   for v2/v3 (the random gate weights are not saved in the adapter, so an unpatched eval would
+   use different random gates).
+
+8. **GRPOConfig / repetition_penalty.** `GRPOConfig` (vendored `trl/trainer/grpo_config.py`)
+   has NO `repetition_penalty` field, and the trainer's `GenerationConfig`
+   (`trl/trainer/grpo_trainer.py:427-432`; compiled twin
+   `unsloth_compiled_cache/UnslothGRPOTrainer.py:891-896`) sets only
+   `max_new_tokens/do_sample/temperature/pad_token_id`. **repetition_penalty is currently set
+   nowhere.** The spec's fixed `repetition_penalty = 1.2` will be applied by assigning
+   `trainer.generation_config.repetition_penalty` after trainer construction in the new
+   variant scripts.
+
+9. **`FORMAT_REWARD` / `REASONING_BONUS` / `_is_repetition_loop`.** **None of these exist in
+   the current `utils.py`.** The reward (`utils.py:39-62`, `get_reward_func`) is pure outcome ×
+   format-match: 1.0 iff extracted answer equals gold AND `####` occurs exactly once, else 0.0.
+   They must be added (defaults 0.0 / disabled) without changing default behaviour.
+
+10. **`hrpo_analysis.py` is lost.** Only `__pycache__/hrpo_analysis.cpython-312.pyc` remains;
+    the source is not in the working tree nor anywhere in git history (repo has 5 commits, none
+    include it). Bytecode inspection shows it contained `HRPOAnalyser`
+    (`_register_hooks`/`_make_hook` via `register_forward_hook`, `_token_category`, PCA,
+    lambda-distribution, reward-ratio plots) and a `HRPOAnalysisCallback`. Because the source
+    cannot be extended, `analyse_gate.py` will be written fresh, reusing the same
+    forward-hook mechanism design (hooks on `thinking_residual_gate_r/gate_i/Lambda`).
+
+11. **`_experiment_is_complete` does not exist** in `hrpo_gsm8k.py`; the current guard is
+    `os.path.exists(exp_name) and len(os.listdir(exp_name)) > 0` (`hrpo_gsm8k.py:25-27`).
+    A stricter completeness check (checkpoint with `trainer_state.json` whose
+    `global_step == max_steps`) will be implemented in the new infrastructure.
+
+12. **`eval_gsm8k.py` format.** `evaluate_model(model_path, adapter_path, temperature,
+    is_inference, batch_size, num_samples, save_results)` → greedy decode (`is_inference=True`)
+    with `max_new_tokens=512`, saves `{checkpoint}/eval_results.json` with
+    `{'metrics': {accuracy, correct, total, model_path, timestamp}, 'results': [{question,
+    true_answer, generated_answer, full_response, correct}, ...]}`.
+
+13. **Existing checkpoints and their exact hyperparameters** (from `training_args.bin` +
+    `trainer_state.json` + wandb metadata):
+    - `experiments/Qwen2.5-1.5B-Instruct-gsm8k-group8-lora32-rmin0.98-temp0.5/checkpoint-1868`:
+      the protected HRPO baseline. group8, per-device bs 8, ga 4, r_min 0.98, temp 0.5,
+      seed 42. Full 1319-question eval exists (acc 0.658). Does NOT match the ablation
+      hyperparameters (group 4 / bs 4) → it is preserved untouched and is NOT the v4 run.
+    - `experiments/Qwen2.5-0.5B-Instruct-...-rmin0.98-temp0.5/checkpoint-1868`: same, 0.5B
+      (acc 0.4215, full eval).
+    - `experiments/1.5b-v1_grpo_baseline/checkpoint-1868`: trained 2026-05-23 by a previous
+      (now lost) modified training script with args
+      `--variant_id v1_grpo_baseline --no_gate --gen_rep_penalty 1.0 --format_reward 0.0
+      --reasoning_bonus 0.0`, group 4, bs 4, ga 4, seed 42 — matches spec §5 exactly EXCEPT
+      repetition_penalty (1.0, i.e. none). `adapter_config.json` shows `modules_to_save: []`
+      (LoRA only). Its `eval_results.json` covers only 100 samples → must be re-evaluated on
+      the full test set.
+    - wandb runs of 2026-05-24/25 show two aborted `v2_hrpo_gate_only` attempts (an older
+      variant scheme); no checkpoints exist for them. The current 6-variant spec supersedes
+      that scheme.
+
+14. **`hidden_ratio` is already logged per training step.** The compiled trainer
+    (`UnslothGRPOTrainer.py:1187-1202`) appends `embeds_ratio`, `hidden_ratio`,
+    `completion_length`, `kl` to `_metrics`, which land in each checkpoint's
+    `trainer_state.json` `log_history` alongside `reward`. Task 4 Plots 4/5/6 will read these
+    directly from `trainer_state.json` — no wandb dependency.
+    Note artifact: the v1 run logs `hidden_ratio ≈ 1.0` because its (bypassed) random gates
+    still reported `a_t ≈ 0` for think tokens; v1 hidden ratio is 0 **by definition** and will
+    be treated as such in analysis.
+
+15. **`patch.py` weight decay on Lambda.** Spec said Λ weight decay was "already fixed to 0.0 —
+    verify". **It is NOT**: `patch.py:39-45` gives the `thinking_residual_Lambda` group
+    `weight_decay = self.args.weight_decay` (= 0.1). Per the HRPO paper (App. A) the 0.1 decay
+    on Λ is *intentional* (pushes Λ down → hidden ratio up), and both protected checkpoints
+    were trained with it. It is left at 0.1 for all variants to preserve comparability with
+    the published method; no change made.
+
+16. **`hrpo_overhead.py`** already provides: component-wise `count_parameters`,
+    `estimate_gate_flops` (MAC convention), `measure_wall_clock`, `measure_memory_overhead`
+    (with `torch.cuda.empty_cache()`), isolated-subprocess timing (`_run_isolated_timing`),
+    `run_all_scales`, `_discover_best_checkpoint`. Task 5 will extend it with a variant
+    dimension rather than duplicating it.
+
+**Reason:** Section 0 rule 1 and Section 2 of the task spec require this mapping before any
+code.
+
+**Assumption (if any):**
+- (a) The existing `1.5b-v1_grpo_baseline/checkpoint-1868` is accepted as the ablation's 1.5B
+  v1 run (hyperparameters verified identical to §5 except `repetition_penalty`), per §7 rule 4
+  (skip runs with a valid checkpoint). The `repetition_penalty` mismatch (1.0 vs the spec's
+  1.2 for new runs) is a known confound and is flagged in the final report; retraining v1 with
+  1.2 only requires deleting/renaming the directory and re-running `run_ablations.sh`.
+- (b) New variant scripts implement "no gate" (v1) by setting `model.answer_start = ""` so
+  `is_thinking` is always False: the blend is skipped for every token in both rollout and loss
+  forward, giving numerically pure GRPO. This was chosen over weight surgery because it is
+  minimal, reversible, and verifiable (embeds_ratio ≡ 1).
+- (c) Evaluation must mirror the training-time gate configuration (v1: gate disabled;
+  v2/v3: unit-gate patch; v4-v6: stock path). The stock `eval_gsm8k.py` is kept untouched for
+  the protected checkpoints; `eval_all.py` implements variant-aware loading with the same
+  decode/scoring code path.
+
+**Verification:** all line numbers quoted above were read directly from the files in this
+working tree; `training_args.bin` values dumped with torch.load for all three existing
+checkpoint-1868 dirs; peft `ModulesToSaveWrapper.__getattr__` source inspected in
+`.venv/lib/python3.12/site-packages/peft/utils/other.py:243-266`.
+
+---
+
+### [2026-07-13 01:25] Add FORMAT_REWARD / REASONING_BONUS / _is_repetition_loop to utils.py
+
+**File(s):** utils.py
+
+**Change:** Added module constants `FORMAT_REWARD = 0.0`, `REASONING_BONUS = 0.0`, a
+character-level repetition-loop detector `_is_repetition_loop` (regex backreference over the
+final 600 chars: any 8-120 char substring repeated >= 4x back-to-back), and extended
+`get_reward_func(process_answer_func, format_reward=None, reasoning_bonus=None,
+zero_repetition_loops=False)`. With defaults the reward is bit-identical to the previous
+implementation (1.0 iff correct AND exactly one `####`, else 0.0). Shaping semantics:
+`+format_reward` when `####` occurs exactly once; `+reasoning_bonus` additionally when >= 10
+chars of reasoning precede `####`; `zero_repetition_loops=True` zeroes the total reward when a
+loop is detected (v6).
+
+**Reason:** Spec Section 2 found these do not exist; v5/v6 (Section 6) require them. Additive
+change keeps rule 3 (baseline preservation) intact because default behaviour is unchanged.
+
+**Assumption (if any):** The spec does not define the loop detector or bonus semantics.
+Character-level detection was chosen because the paper's observed loops include CJK text
+without whitespace (paper Fig. 25); thresholds (8-120 chars, >= 4 repeats, 600-char tail) flag
+paper-style loops but not legitimate structured reasoning ("Step 1: ... Step 2: ...").
+REASONING_BONUS rewards a non-trivial (>= 10 char) reasoning span before `####`, per the
+paper's discussion of premature answer emission.
+
+**Verification:** Unit test executed with .venv python: default rewards on 5 crafted
+completions equal original semantics ([1,0,0,0,1]); v5 shaping gives [1.15,0.15,0,0,1.15];
+v6 zeroing gives [...,0.0] on the loop case; detector flags "能量大"x40 and a repeated CJK
+phrase, and does NOT flag normal arithmetic reasoning or enumerated steps. All assertions
+passed ("ALL PASS").
+
+---
+
+### [2026-07-13 01:55] Task 1 — variant training infrastructure (variant_common.py + six variant scripts)
+
+**File(s):** variant_common.py (new), hrpo_grpo_baseline.py (new), hrpo_fixed_blend.py (new),
+hrpo_learned_lambda.py (new), hrpo_full_gate.py (new), hrpo_format_reward.py (new),
+hrpo_full.py (new)
+
+**Change:** Added `variant_common.py` with variant-neutral helpers (Section 5 defaults arg
+parser; `experiments/{size}-{variant_id}` naming; strict `experiment_is_complete`
+[checkpoint trainer_state.json with global_step == max_steps]; `get_inner_model`;
+`apply_unit_gate_patch` [instance-level Eq.4 with r_t=i_t=1]; `disable_gate`
+[answer_start=""]; `freeze_gate_modules`; `assert_optimizer_gate_params`;
+`set_rollout_repetition_penalty`; `GateGradientLogger` [per-step L2 grad norms of
+Lambda/gate_r/gate_i/LoRA to gradient_log.jsonl via on_pre_optimizer_step]; `RunLogger` +
+`merge_training_log` for train_summary.json / training_log.json]. Added six standalone variant
+scripts, each a full copy of the hrpo_gsm8k.py flow differing only in its Section 6 knobs:
+v1 no gate (modules_to_save=None, no reset, gate disabled, no patch_trainer_optimizer);
+v2 all three gate modules saved then frozen + unit gates; v3 Lambda-only saved/trained + unit
+gates; v4 standard HRPO; v5 = v4 + format_reward 0.1 / reasoning_bonus 0.05;
+v6 = v5 + repetition-loop zeroing. hrpo_gsm8k.py, patch.py untouched.
+
+**Reason:** Spec Sections 6 and 7 (Task 1): independently runnable, auditable variant scripts.
+
+**Assumption (if any):**
+- v1's gate disable uses `answer_start = ""` (is_thinking always False), chosen per mapping #7
+  and logged assumption (b) in the first entry.
+- Discovered during smoke testing: peft's `ModulesToSaveWrapper.enable_adapters` (fired when
+  the trainer's `disable_adapter()` context for reference log-probs exits) re-sets
+  `requires_grad=True` on adapter copies each step. v2's freeze is nevertheless effective
+  because the optimizer param groups are constructed while frozen, so the gate params are
+  never registered with the optimizer. Documented in `freeze_gate_modules`; verified below.
+- The final Trainer checkpoint is saved at train end even when max_steps < save_steps, so
+  every completed run exposes a `checkpoint-{max_steps}` directory for evaluation.
+
+**Verification:** End-to-end smoke test (scratchpad/smoke_one.py) ran each of the six variants
+on Qwen2.5-0.5B with 4 GSM8K prompts (bs 2, group 2, 96 completion tokens) through real
+rollouts, reward computation, backward and optimizer steps. Assertions all passed:
+- v1: modules_to_save=[], hidden_ratio NaN at every step (blend never fired), coherent
+  pure-token rollouts, no unit-gate patch.
+- v2: hidden_ratio constant 0.1456 across steps (expected ~0.12 for U[0.98,0.999] init);
+  Lambda tensor bit-identical after training; no thinking_residual param in any optimizer
+  group.
+- v3: only Lambda trainable (in optimizer), unit-gate patch active, gradient_log.jsonl has
+  Lambda norm > 0 and gate_r/gate_i null.
+- v4/v5/v6: stock gate, all three modules trainable, gradient log has non-null Lambda AND
+  gate norms; initial hidden_ratio 0.1033 (< v2/v3, consistent with random r_t≈0.5 raising
+  a_t = u^r_t).
+- All variants: rollout GenerationConfig repetition_penalty == 1.2;
+  train_summary.json written with peak GPU memory; optimizer param-group assertions passed
+  (v1/v2 no gate params; v3 Lambda only; v4-v6 Lambda + gates).
+
+### [2026-07-13 02:00] Task 1 — run_ablations.sh
+
+**File(s):** run_ablations.sh (new)
+
+**Change:** Driver accepting `--model_size [0.5b|1.5b|3b|all]` and `--variant [v1..v6|all]`
+(extra args after `--` pass through to the variant scripts). Encodes the Section 6 matrix
+(all six variants at 1.5b; v1/v2/v4/v6 at 0.5b and 3b), skips runs already complete via
+`variant_common.experiment_is_complete`, continues past failed runs, and merges each run's
+start/end time, status and peak GPU memory (from train_summary.json) into the shared
+training_log.json via `variant_common.merge_training_log`.
+
+**Reason:** Spec Section 7 (Task 1) items 1-5.
+
+**Assumption (if any):** `_experiment_is_complete` "already present in hrpo_gsm8k.py" (spec
+§7.4) does not exist there (mapping #11); the stricter check in variant_common is used
+instead. The pre-existing 1.5b-v1 checkpoint is detected as complete and will be skipped
+rather than retrained (see mapping assumption (a) re: its repetition_penalty=1.0).
+
+**Verification:** `bash -n` syntax check passed; `experiment_is_complete` returns True for
+`experiments/1.5b-v1_grpo_baseline` and the protected HRPO dir, False for a nonexistent dir;
+arg-parser defaults verified (rp 1.2, r_min 0.98, bs 4, group 4).
+
+---
+
+### [2026-07-13 02:35] Task 2 — eval_gsm8k.py additive gate_mode support + eval_all.py
+
+**File(s):** eval_gsm8k.py (modified, additive), eval_all.py (new)
+
+**Change:** `evaluate_model` gained three optional, default-preserving parameters:
+`gate_mode` ("standard" | "unit" | "disabled"; default "standard" = previous behaviour),
+`adapter_path=None` support (base zero-shot), and `save_path` override. `gate_mode` mirrors the
+training-time gate configuration: "disabled" (answer_start="") for v1 and base models,
+"unit" (apply_unit_gate_patch) for v2/v3, "standard" for v4-v6 and the legacy checkpoints.
+Metrics now additionally record base_model and gate_mode. New `eval_all.py` implements
+Section 8: discovery of final checkpoints under experiments/ (both `{size}-{variant}` and
+legacy `Qwen2.5-*` names), base-model zero-shot reference evals to
+results/base_model_evals/{size}_base.json, missing-eval driver (an eval counts as complete
+only when total >= 1319), Wilson 95% CIs, McNemar tests with continuity correction (vs v1 and
+vs the immediately preceding available variant in the Section 6 chain, guarded by a
+question-order pairing check), results/comparison_table.{json,csv}, and a printed summary.
+
+**Reason:** Spec Section 8 (Task 2); rule 7 (single greedy decode per question — inherited
+from evaluate_model's is_inference=True path).
+
+**Assumption (if any):**
+- Base zero-shot and v1 evals run with the gate disabled: without an HRPO-trained adapter the
+  gate weights are random and the hybrid path corrupts generation. The pre-existing
+  0.5b base eval (0.00 accuracy over 100) is consistent with having been run with random
+  gates active; it will be re-evaluated. (New spot check: 0.5B base with gate disabled gets
+  1/8 on a smoke subset.)
+- "Discovers every checkpoint" is implemented as the final (highest-step) checkpoint per
+  experiment; evaluating every intermediate checkpoint would triple GPU cost without adding a
+  comparison-table row. Intermediate checkpoints remain evaluable by pointing eval_gsm8k.py
+  at them directly.
+- Verified empirically that transformers' `load_adapter` correctly loads `modules_to_save`
+  gate weights (Lambda matches the adapter file up to bf16 rounding), so no custom loading is
+  needed.
+
+**Verification:**
+- Unit tests: wilson_ci(868,1319) = (0.632, 0.683); wilson_ci(0,100) = (0, 0.037);
+  McNemar b=15/c=5 gives chi2 = 4.05, p = 0.0442 (hand-checked); zero-discordance returns
+  (0, 1).
+- `eval_all.py --skip_eval` rebuilt the comparison table from existing results: 3 experiments
+  discovered; the 1.5b base-vs-v1 McNemar (chi2 0.174, p 0.6767) exactly reproduces the
+  values stored in the pre-existing comparison_table.json by the lost pipeline; the 100-sample
+  v1 eval is correctly not paired against 1319-sample legacy evals.
+- End-to-end smoke: evaluate_model on the v2 smoke checkpoint with gate_mode="unit" (2/8) and
+  base zero-shot with gate_mode="disabled" (1/8), both saving well-formed eval_results.json.
+
+---
+
+### [2026-07-13 03:05] Task 3 — stats_utils.py + analyse_failures.py
+
+**File(s):** stats_utils.py (new), analyse_failures.py (new), eval_all.py (imports moved)
+
+**Change:** Moved wilson_ci/mcnemar_test into a lightweight `stats_utils.py` (so analysis
+scripts don't import unsloth/torch through eval_all). Added `analyse_failures.py` per Section
+9: takes two evaluated checkpoint paths (HRPO variant + v1 GRPO baseline), verifies the evals
+are paired (same length + question-order probes), builds the 2x2 confusion matrix
+(counts/percentages with Wilson CIs on each quadrant proportion and per-model accuracy),
+sub-categorises HRPO-wrong responses (repetition_loop via _is_repetition_loop -> format
+failure [`####` absent or >1] -> wrong_answer_correct_format; empty_response checked first),
+computes the answer-magnitude difficulty proxy (<=10 / 11-100 / >100 with Wilson CIs per
+group per model), writes the first 20 "GRPO only correct" examples as markdown with both full
+responses, saves results/failure_analysis.json (keyed by comparison tag so multiple pairs
+accumulate) and two plots (error-category bars; difficulty grouped bars with CI whiskers)
+using a shared CVD-validated palette (plot_style.py, fixed variant->hue mapping).
+
+**Reason:** Spec Section 9 (Task 3); plots feed Task 6.
+
+**Assumption (if any):** "Per-category accuracy with 95% Wilson CIs" is implemented as Wilson
+CIs on (a) each confusion-quadrant proportion, (b) each model's overall accuracy, and (c)
+accuracy per difficulty group — covering both plausible readings. Error sub-categorisation is
+reported for the primary "GRPO only correct" group and, as context, for all HRPO-wrong
+responses. Loop detection takes precedence over format failure since loops usually also break
+the format.
+
+**Verification:** Synthetic paired evals (12 questions covering all four quadrants and all
+four error kinds) produced the exactly expected confusion matrix (4/2/4/2), expected error
+sub-categories (loop 1 / format 1 / wrong-format 2), 4 markdown examples, and both plots
+(rendered and visually checked: grouped bars, CI whiskers, correct fixed colors).
+categorise_error unit-checked on empty/double-tag/no-tag/loop/wrong-answer inputs;
+difficulty_group on 3/50/500/-500.
+
+---
+
+### [2026-07-13 03:50] Task 4 — analyse_gate.py (8 plots + gradient flow + activation variance)
+
+**File(s):** analyse_gate.py (new), plot_style.py (new), variant_common.py (VARIANT_CHAIN /
+GATE_MODES moved here so eval_all.py and analyse_gate.py share one registry), eval_all.py
+(imports updated)
+
+**Change:** New analyse_gate.py implementing all Section 10 analyses, split into a static
+group (no GPU: Plots 2/3/4/5/6 + gradient-flow, computed from adapter_model.safetensors
+Lambda vectors, trainer_state.json log_history [which already logs per-step hidden_ratio and
+reward — mapping #14] and gradient_log.jsonl) and a dynamic group (GPU: Plots 1/7/8 +
+gate-activation variance, regenerating completions with return_thinking_embeds=True and
+reading the per-token embeds_ratio the model already emits at
+unsloth/models/llama.py:947-1025). Quantities accumulate in results/gate_analysis.json;
+figures in results/plots/. plot_style.py fixes a CVD-validated palette and a permanent
+variant->hue mapping used by every figure.
+
+**Reason:** Spec Section 10 (Task 4); the original hrpo_analysis.py source is lost (mapping
+#10) so this is a fresh implementation reusing the same signal sources.
+
+**Assumption (if any):**
+- Plot 2/3 use the codebase Lambda convention a = exp(-8*softplus(-Λ)) (mapping #3), NOT the
+  spec's literal exp(-8*softplus(Λ)); verified numerically against the torch module
+  (max |diff| < 1e-6).
+- LOWESS is a local tricube-weighted linear regression implemented in numpy (statsmodels is
+  not installed in .venv); recovers sin(3x) from noisy samples with mean abs error 0.0098.
+- Per-token alignment: embeds_ratio[:, i] corresponds to input token input_ids[:, i]
+  (derived from the _sample/forward bookkeeping; prompt positions and the final token are
+  filled with ratio 1). Think span = completion tokens strictly before the first ANSWER_START
+  occurrence (string-accumulated per token), which also covers v1 (whose thinking_mask is
+  all-False by construction).
+- Plot 7 uses the Eq.3 projected hidden states (thinking_embeds) as "think-span hidden
+  states" — these are the latent representations the gate blends, and they are computed for
+  all variants including v1.
+- Gate-activation variance "across responses to the same question" uses multi-sample
+  generation (is_inference=False, 4 samples/question by default). This is analysis
+  instrumentation, not evaluation — spec rule 7 (single greedy decode) continues to hold for
+  all accuracy numbers.
+
+**Verification:**
+- lambda_to_ratio matches the torch reference (exp/softplus/sqrt chain) to 1e-6.
+- Static plots run on real artifacts: the protected 1.5B HRPO checkpoint yields Λ CV 0.277
+  (0.5B: 0.278), final hidden ratio 0.137, and reward-vs-ratio Pearson r=0.200 (p=2.4e-18),
+  Spearman r=0.081 (p=4.6e-4) over 1868 logged steps; gradient-flow plot renders from the v3
+  smoke log (Lambda norms present, gate norms null as expected).
+- Dynamic analyses ran end-to-end on the 0.5B smoke checkpoints: Plot 1 (6 examples;
+  near-uniform ratios ~0.1033 across categories, correct for a 4-step model), Plot 8
+  (v2 rows std_within == 0.0 exactly — frozen Λ + unit gates — vs v4 std_within > 0),
+  activation variance (~0 for near-untrained v4), Plot 7 PCA over v1/v2/v4 (EVR 28%/12%).
+  All four figures rendered and visually checked; heatmap title spacing fixed after review.
+
+---
+
+### [2026-07-13 12:20] Task 5 — hrpo_overhead.py variant-matrix extension
+
+**File(s):** hrpo_overhead.py (extended; existing functions untouched)
+
+**Change:** Added a `--variant_matrix` mode (plus `--matrix_sizes/--matrix_variants/
+--gen_prompt_len/--gen_tokens/--gen_batch/--n_gen_runs/--matrix_output`) implementing spec
+Section 11 over the ablation checkpoints under experiments/{size}-{variant}/:
+- `variant_param_breakdown` — analytic gate parameter counts (gate_r/gate_i: h(h+1) each,
+  Lambda: h) reported as total AND trainable per variant (v1: 0/0; v2: total saved but 0
+  trainable; v3: Lambda only; v4-v6: all), cross-checked against the parameters actually
+  saved in each adapter_model.safetensors.
+- `estimate_gate_flops_variant` — the existing MAC-convention derivation (Kaplan et al. 2020,
+  baseline 6·N·D) split into projection / gate-linear / Lambda+blend components and switched
+  per variant (v1: zero; v2/v3: projection + Lambda/blend only, since the unit-gate patch
+  bypasses the gate linears entirely; v4-v6: all).
+- `_run_isolated_generation_timing` — one fresh subprocess per (size, variant) that times
+  real `generate()` calls with the hybrid path ON (answer_start = U+FFF0, never decoded) vs
+  OFF (answer_start = ""), decode length pinned via min_new_tokens == max_new_tokens so both
+  configs execute identical step counts; peak memory recorded per run after
+  torch.cuda.empty_cache() + reset_peak_memory_stats (the existing memory methodology),
+  averaged over n runs; plus a microbenchmark of the Eq.3 projection einsum.
+- `run_variant_matrix` — drives the loop, prints the sizes x variants wall-clock table, the
+  FLOPs table and the params total/trainable breakdown, and saves
+  results/overhead_matrix.json.
+
+**Reason:** Spec Section 11 (Task 5).
+
+**Assumption (if any):**
+- Discovered while extending: the pre-existing wall-clock methodology times bare
+  `model(input_ids=...)` forward passes, which never receive `is_thinking`/
+  `last_thinking_states` — the Eq.4 blend NEVER executes on that path and the Eq.3 projection
+  (inside the generation loop) is not exercised either, so it measured LoRA overhead only.
+  The new matrix therefore times generation with the hybrid path toggled via `answer_start`,
+  which is the mechanism the codebase itself uses to delimit the think span. The existing
+  functions/flags are left untouched for backwards compatibility.
+- The Eq.3 projection einsum runs unconditionally in the patched `_sample` for every variant
+  (including v1), so the ON-vs-OFF wall-clock difference isolates the Eq.4 blend; the
+  projection's own cost is reported separately via the microbenchmark
+  (production runs under unsloth's bf16 autocast, so the benchmark casts to the embedding
+  dtype after an initial dtype-mismatch failure was fixed).
+- v1's wall-clock overhead is 0 by construction (gate disabled) and its subprocess timing is
+  skipped.
+
+**Verification:** Ran the matrix at 0.5b against the protected legacy HRPO checkpoint
+(stand-in for v2/v4 rows; the session's smoke checkpoints were ephemeral): parameter table
+gives total 1,608,320 = 2·(896²+896)+896 with trainable 0/0/1,608,320 for v1/v2/v4; FLOPs
+overhead 0% / 7.33% / 7.41% (projection-dominated at 0.5B, consistent with the expectation
+that FLOPs%% falls with model size); generation timing subprocesses completed for both gate
+modes (ON/OFF deltas within noise at 3 runs x 32 tokens — real runs should use the defaults,
+5 runs x 128 tokens), projection einsum measured at 0.687 ms/step; JSON saved and tables
+printed.
+
+---
+
+### [2026-07-13 12:45] Task 6 — generate_report.py
+
+**File(s):** generate_report.py (new)
+
+**Change:** Report generator reading results/{comparison_table,failure_analysis,
+gate_analysis,overhead_matrix}.json and producing: five LaTeX tables in
+results/latex_tables/ (Table 1 ablation accuracy with Wilson CIs incl. base zero-shot and
+legacy reference rows; Table 2 McNemar p-values for consecutive-chain pairs and each variant
+vs v1, starred at p<0.05; Table 3 failure-mode breakdown at 1.5B; Table 4 overhead
+[gate params total/trainable, FLOPs, wall-clock, memory]; Table 5 Lambda heterogeneity CVs);
+two summary figures in results/plots/ (ablation accuracy bar chart with CI whiskers, one
+panel per size; scale-vs-accuracy line plot per variant); an idempotent regeneration pass of
+the static gate figures via analyse_gate.run_static plus a pending-list for the GPU-bound
+ones; and results/key_findings.txt with one entry per Section 13 research question, each
+citing the specific supporting numbers, or an explicit PENDING line naming the exact command
+that will produce the missing data.
+
+**Reason:** Spec Section 12 (Task 6).
+
+**Assumption (if any):** Since only the 1.5B v1 checkpoint and the two legacy HRPO
+checkpoints currently exist (14 ablation training runs are still to be executed on the
+training machine), key_findings.txt is designed to be regenerated after every batch of runs:
+statements switch automatically from PENDING to numeric findings once eval_all.py /
+analyse_gate.py / analyse_failures.py / hrpo_overhead.py --variant_matrix outputs appear.
+Non-ASCII Λ in variant labels is converted to $\Lambda$ for LaTeX.
+
+**Verification:** Ran twice on current results/: all five .tex files written (booktabs
+tabulars; spot-checked Table 1 shows base 0.5b 0.00 [0.0,3.7], base 1.5b 64.00 [54.2,72.7],
+v1 67.00 [57.3,75.4], legacy rows 42.15/65.81 with correct CIs; no raw unicode Λ remains in
+any .tex), both figures rendered and visually checked, key_findings.txt has all 12 RQ
+sections with accurate PENDING markers, static gate regeneration ran (plot 5 refreshed;
+plots 2/3/4/6 correctly reported pending because no v2-v6 checkpoints exist yet).
+
+---
+
+### [2026-07-13 12:50] Final state summary (no code change)
+
+**File(s):** none
+
+**Change:** All six tasks delivered and smoke-tested. Deliverables per spec Section 14:
+hrpo_grpo_baseline.py, hrpo_fixed_blend.py, hrpo_learned_lambda.py, hrpo_full_gate.py,
+hrpo_format_reward.py, hrpo_full.py, variant_common.py, run_ablations.sh, eval_all.py,
+analyse_failures.py, analyse_gate.py, generate_report.py, stats_utils.py, plot_style.py,
+changes.md; utils.py and eval_gsm8k.py extended additively (defaults preserve prior
+behaviour); hrpo_overhead.py extended with --variant_matrix; hrpo_gsm8k.py and patch.py
+untouched. All Python files pass py_compile; run_ablations.sh passes bash -n.
+
+**Reason:** Spec Section 15 requires the log to close out each task.
+
+**Assumption (if any):** none.
+
+**Verification:** Remaining work is compute, not code: (1) `./run_ablations.sh --model_size
+all --variant all` (13 runs; 1.5b-v1 skips as complete), (2) `python eval_all.py`
+(re-evaluates the 100-sample v1 and stale base evals to the full 1319 set),
+(3) `python analyse_gate.py --static` and `--dynamic --model_size <size>` per size,
+(4) `python analyse_failures.py experiments/{size}-v4_full_hrpo_gate/checkpoint-1868
+experiments/{size}-v1_grpo_baseline/checkpoint-1868` (and other pairs of interest),
+(5) `python hrpo_overhead.py --variant_matrix`, (6) `python generate_report.py`.
+
+---
+
+### [2026-07-13 13:15] Cluster job scripts + concurrent-safe training log
+
+**File(s):** cluster/run_variant.slurm (new), cluster/submit_all.sh (new),
+cluster/run_eval_and_analysis.slurm (new), variant_common.py (merge_training_log now
+flock-guarded)
+
+**Change:** Added SLURM scripts following the Auckland cluster guidelines (single GPU,
+job-name/time/output via sbatch flags, environment block with HOME/TMPDIR/HF_HOME/proxy/
+TORCHDYNAMO_DISABLE, cd /data/ztay632/Dissertation-HRPO + .venv activation).
+`run_variant.slurm` takes MODEL_SIZE/VARIANT_NUM via --export and delegates to
+run_ablations.sh (skip logic + training_log.json). `submit_all.sh` submits the Section 6
+matrix (1.5b: v1-v6; 0.5b/3b: v1,v2,v4,v6 = 14 jobs) with wall times 24h/30h/48h for
+0.5b/1.5b/3b, optionally filtered to one size/variant. `run_eval_and_analysis.slurm` runs the
+whole post-training pipeline (eval_all -> analyse_gate static+dynamic -> analyse_failures for
+v4/v6 vs v1 per size -> hrpo_overhead --variant_matrix -> generate_report).
+`merge_training_log` now takes an exclusive fcntl flock on training_log.json.lock so
+concurrent jobs finishing together cannot clobber each other's entries.
+
+**Reason:** The 14 training runs execute on the SLURM cluster; concurrent jobs share
+training_log.json.
+
+**Assumption (if any):** Wall times sized from the measured 18.5 h wall clock of the
+completed 1.5B v1 run (wandb _runtime) on the local RTX 3060 Ti; cluster GPUs finish earlier
+and jobs simply end. WANDB_MODE defaults to offline on the cluster (all analyses read
+trainer_state.json, so nothing depends on wandb being online); override by exporting
+WANDB_MODE=online before submitting.
+
+**Verification:** bash -n passes on all three scripts; flock-guarded merge_training_log
+exercised against a temp log (entry written, lock file created/cleaned).
+
+---
+
+### [2026-07-13 13:25] Cluster wandb mode: online by default
+
+**File(s):** cluster/run_variant.slurm, cluster/run_eval_and_analysis.slurm
+
+**Change:** Removed the WANDB_MODE=offline default from both SLURM scripts — the cluster
+account is logged in to wandb and the proxy variables are exported, so training jobs log
+online to the "latent-reasoning" project as before. Offline mode remains available by
+exporting WANDB_MODE=offline before submitting.
+
+**Reason:** User confirmed the cluster is authenticated with wandb.
+
+**Assumption (if any):** none.
+
+**Verification:** bash -n passes on both scripts.
+
+---
+
+### [2026-07-14 10:05] Resume-from-checkpoint + wall-time resizing (cluster throughput)
+
+**File(s):** variant_common.py, hrpo_grpo_baseline.py, hrpo_fixed_blend.py,
+hrpo_learned_lambda.py, hrpo_full_gate.py, hrpo_format_reward.py, hrpo_full.py,
+cluster/submit_all.sh
+
+**Change:** Added `latest_checkpoint()` and `train_with_resume(trainer, exp_dir)` to
+variant_common; all six variant scripts now call `train_with_resume` instead of
+`trainer.train()`, so a run killed at the SLURM wall-time limit resumes from its newest
+checkpoint (save_steps=250 -> at most 250 steps lost) when resubmitted. Removed the redundant
+"incomplete dir" warning from exit_if_complete (an incomplete dir is now the normal resume
+case). Raised submit_all.sh wall times to 72h (1.5b) / 120h (3b) / 30h (0.5b), overridable
+with MAX_WALLTIME=... to clamp to the partition limit.
+
+**Reason:** Measured cluster throughput of the 1.5b-v3 run is ~115 s/step over 1868 optimizer
+steps (~60 h), which exceeded the previous 30 h request; the job would have been killed at
+~step 950. Step count comes from the spec's §5 hyperparameters:
+steps = 7473 prompts x group_size 4 / (per_device_bs 4 x grad_accum 4) = 1868.
+
+**Assumption (if any):** Per-step time is ~2x the earlier per_device_bs=8 run's while doing
+half the completions per step (16 vs 32), i.e. roughly 4x the wall clock for the same 29,888
+completions per epoch. The most likely cause is reduced generation parallelism at bs=4 (the
+GPU is under-fed during rollouts). The §5 hyperparameters are NOT changed — the existing
+1.5b-v1 checkpoint was trained with bs=4/ga=4 and comparability across variants is the point
+of the ablation. Speed is therefore bought with wall time + resume, not with a config change.
+
+**Verification:** All six scripts + variant_common pass py_compile; submit_all.sh passes
+bash -n; latest_checkpoint returns the highest-numbered checkpoint dir containing
+trainer_state.json.
+
+---
+
+### [2026-07-14 10:30] Hyperparameters realigned to HRPO paper Table 4/5 (supersedes spec §5)
+
+**File(s):** variant_common.py (build_arg_parser defaults), cluster/submit_all.sh (comment)
+
+**Change:** per_device_train_batch_size 4 -> 8; max_prompt_length 1024 -> 512;
+max_completion_length 1024 -> 512. group_size (4), gradient_accumulation_steps (4) and all
+other §5 values unchanged.
+
+**Reason:** The dissertation spec's Section 5 deviates from the HRPO paper it reproduces.
+Paper Table 4 gives, for GSM8k: group 4, grad-accum 4, TOTAL train batch 32 — and since
+total = per_device x grad_accum, per_device must be 8 (per_device 4 would give a total of 16).
+Table 5 gives GSM8k prompt/completion = 512/512, not 1024/1024. The spec's values cost 4x per
+completion: each optimizer step issues grad_accum generate() calls regardless of batch size,
+so 1024-token completions double per-step decode time (measured: 115 s/step vs 57 s/step)
+while a per-device batch of 4 halves the completions produced per step. They also mismatched
+eval_gsm8k.py, which decodes at max_new_tokens=512. User confirmed the paper values.
+
+Effect: optimizer steps = 7473 prompts x group 4 / (per_device 8 x grad_accum 4) = 934
+(was 1868); ~57 s/step measured -> ~15 h per 1.5B run (was ~60 h). Same 29,888 completions
+per epoch either way.
+
+**Assumption (if any):** In this TRL GRPO version the RepeatRandomSampler repeats each prompt
+num_generations times, so per_device_train_batch_size counts COMPLETIONS (not prompts) and
+must be divisible by group_size — 8 % 4 == 0 holds. Verified the derived step count (934)
+matches the previously observed 934-step run at per_device 8.
+
+**Consequence (action required):** experiments/1.5b-v1_grpo_baseline was trained with the old
+values (per_device 4, 1024/1024) and is NO LONGER comparable to v2-v6. It must be removed (or
+renamed) so run_ablations.sh does not skip it, and v1 retrained under the paper config. All
+14 runs then share identical settings.
+
+**Verification:** build_arg_parser defaults now yield per_device 8 / ga 4 / group 4 ->
+total train batch 32 (= paper), prompt/completion 512/512 (= paper), 934 optimizer steps
+(= the observed 934-step run), and per_device % group_size == 0. py_compile + bash -n pass.
+
+---
+
+### [2026-07-14 10:45] Resume config guard + unbuffered SLURM stdout
+
+**File(s):** variant_common.py (train_with_resume), all six variant scripts (pass args),
+cluster/run_variant.slurm
+
+**Change:** `train_with_resume(trainer, exp_dir, args)` now writes a hyperparameter
+fingerprint (run_config.json: model_size, lora_rank, lr, beta, seed, residual_r_min/max,
+group_size, temperature, grad_accum, per_device_bs, prompt/completion lengths,
+repetition_penalty) into the experiment directory, and REFUSES to resume a checkpoint whose
+stored fingerprint differs from the current run — printing exactly which fields changed and
+the `rm -rf <exp_dir>` needed to start clean. Also exports PYTHONUNBUFFERED=1 in the SLURM
+script and echoes the resolved StdOut/StdErr paths at job start.
+
+**Reason:** (a) With resume enabled, a partial checkpoint from the pre-realignment config
+(per_device 4, 1024-token completions) would otherwise be silently continued under the new
+paper config, mixing hyperparameters mid-run. (b) Python block-buffers stdout to a file, so a
+job cancelled before its first flush left an empty .log (only tqdm's stderr output appeared),
+which made a running job look like it had no logs at all.
+
+**Assumption (if any):** none.
+
+**Verification:** Unit test with a fake trainer: (1) stale fingerprint (per_device 4 /
+completion 1024) -> SystemExit "REFUSING TO RESUME" naming both changed fields; (2) matching
+fingerprint -> resumes from checkpoint-250; (3) fresh directory -> starts from scratch and
+records run_config.json. All six variant scripts + variant_common pass py_compile;
+run_variant.slurm passes bash -n.
+
+---
+
+### [2026-07-14 11:05] Gradient log is post-clipping — documented + pre-clip reconstruction
+
+**File(s):** variant_common.py (GateGradientLogger docstring), analyse_gate.py
+(unclip_scales + gradient_flow)
+
+**Change:** Documented that GateGradientLogger fires on_pre_optimizer_step, which HF Trainer
+calls AFTER clip_grad_norm_ (transformers/trainer.py:2589 clipping vs :2605 callback), so the
+recorded norms are post-clipping. Added `unclip_scales()` to analyse_gate: clipping scales all
+gradients by c = min(1, max_grad_norm / total_norm_preclip), and the Trainer records
+total_norm_preclip as `grad_norm` in trainer_state.json, so dividing a logged norm by c
+recovers the pre-clip magnitude. gradient_flow() now reports mean, median and mean_preclip per
+parameter group, and carries a note explaining the two.
+
+Also clarified (docstring + gradient_flow docstring) that v1 and v2 legitimately have NO
+gradient_log.jsonl: v2 freezes all three gate modules and they are excluded from the optimizer,
+so there are no gate gradients to record. Only v3-v6 attach the logger (the spec asks for
+gradient flow on v3 and v4).
+
+**Reason:** Observed in the real 1.5b-v3 run: the `lora` column pins at 0.09999979 ≈
+max_grad_norm=0.1 on most steps, which is only possible if the logged norms are post-clipping.
+Left undocumented this would understate absolute gate/Lambda gradient magnitudes in the
+dissertation's gradient-flow analysis.
+
+**Assumption (if any):** Clipping is a uniform rescale of all gradients, so Lambda-vs-gate
+RATIOS (the actual research question — near-zero gate gradient would mean v4 == v3) are exact
+even post-clipping; only absolute magnitudes needed reconstruction.
+
+**Verification:** py_compile passes. Reconstruction checked against the observed v3 values: at
+a pre-clip total norm of 2.5 the scale is 0.04, so a logged Lambda norm of 1.35e-4 corresponds
+to 3.37e-3 pre-clip; when the total norm is below max_grad_norm the scale is 1.0 and the value
+is returned unchanged.
+
+---
+
+### [2026-07-18 21:00] Analysis-pipeline robustness: fault-tolerant evals, dependency preflight, size filter
+
+**File(s):** eval_all.py, requirements_analysis.txt (new),
+cluster/run_eval_and_analysis.slurm
+
+**Change:**
+1. `run_missing_evals` now evaluates each model inside its own try/except: a failure is
+   printed, collected, and the remaining evaluations continue; all failures are re-reported
+   at the end and the function returns them. Previously one exception aborted the whole
+   stage.
+2. Added `--sizes` and `--skip_base` flags to eval_all.py.
+3. Added requirements_analysis.txt (matplotlib==3.10.8, optional hf_xet) — matplotlib is
+   absent from requirements_train.txt because training never plots, so a fresh cluster venv
+   failed every plotting stage.
+4. run_eval_and_analysis.slurm: added a dependency preflight that exits in seconds with the
+   install command if matplotlib/scipy/sklearn/numpy/safetensors are missing; restricted the
+   eval, dynamic-gate, failure and overhead stages to `1.5b 3b` (the sizes actually in the
+   run matrix); added `mkdir -p "$HF_HOME"`.
+
+**Reason:** First real run of Stage 1 on the cluster failed two ways: (a) matplotlib was not
+installed, so every plotting stage raised ModuleNotFoundError; (b) the 0.5b BASE model failed
+to download (`unsloth/Qwen2.5-0.5B-Instruct does not appear to have a file named
+model.safetensors`) and, because the eval loop had no error handling, that single failure
+aborted eval_all.py before ANY of the ten 1.5b/3b ablation checkpoints were evaluated — the
+actual dissertation results. A reference row for a size that is not even in the run matrix
+must never be able to block the results.
+
+**Assumption (if any):** 0.5b is not part of the current run matrix (only 1.5b x 6 and 3b x 4
+were trained), so skipping it costs only the legacy 0.5b reference row. If that row is wanted
+later, pre-download the base model (`huggingface-cli download unsloth/Qwen2.5-0.5B-Instruct`)
+and re-run eval_all.py without `--sizes`; completed evals are skipped, so only the missing
+ones run.
+
+**Verification:** Unit test injecting exactly the observed OSError on the 0.5b base model:
+6 evaluations attempted, 1 failed, and both the 1.5b-v4 and 3b-v6 checkpoints were still
+evaluated; the failure was reported in the end-of-run summary. py_compile + bash -n pass.
+Confirmed matplotlib is the only analysis dependency missing from requirements_train.txt
+(scipy/scikit-learn/numpy/pandas/safetensors are all already pinned there).
+
+---
+
+### [2026-07-19 10:30] Results analysis, results section, 3B v3 follow-up job
+
+**File(s):** results/RESULTS_SECTION.md (new), generate_report.py (partial-eval filter),
+cluster/submit_all.sh (off-matrix variant submission), results/base_model_evals/
+0.5b_base.json -> .stale-100sample
+
+**Change:**
+1. Wrote results/RESULTS_SECTION.md — full dissertation results section covering the
+   ablation tables, the mechanism behind v4's failure, Λ heterogeneity, reward shaping,
+   failure modes, overhead, scale, per-RQ answers and threats to validity.
+2. generate_report.py now excludes rows whose eval is not the full 1319-question test set
+   (printing a warning), so a partial eval cannot be tabulated beside full ones.
+3. cluster/submit_all.sh: an explicitly named variant is now submitted even when it is
+   outside that size's default matrix. Previously `submit_all.sh 3b v3` iterated the 3B
+   matrix (1 2 4 6), matched nothing and submitted NOTHING silently. Added the 0.5b case to
+   variants_for and gated the default size loop on DEFAULT_SIZES.
+4. Renamed the stale 100-sample 0.5b base eval (run with random gates active, 0% accuracy)
+   to .stale-100sample so it stops corrupting Table 1 and the headline figure.
+
+**Reason:** Analysis of the completed 10-run matrix; the 3B v3 follow-up is the highest-value
+remaining experiment because the dissertation's central positive claim (v3 > v1, v3 > v4)
+currently rests on a single scale.
+
+**Key findings recorded:** only v3 (learned Λ, input gates removed) significantly beats the
+GRPO baseline (+4.55, p=0.0004); re-adding the published gate (v4) significantly reverses it
+(-4.40, p=0.0006); published HRPO (v4) is indistinguishable from GRPO at both scales
+(p=0.950, p=0.433). Mechanism: r_t = sigma(W_a e) sits at ~0.5 for every token (per-token
+ratio std 2e-5, a_t variance 0.000), which halves the exponent in
+a_t = exp(-c softplus(-Lambda) r_t) and suppresses the hidden ratio 0.167 -> 0.119;
+substituting r_t = 0.5 into v3's fitted Lambda predicts 0.11857 vs 0.11868 measured.
+Lambda receives 8.7x less gradient in v4 than v3 while the gates carry 2.4x Lambda's.
+
+**Assumption (if any):** The reward-hidden-ratio correlation is reported as a partial
+correlation controlling for training step (r=0.447/0.414) rather than the raw r
+(0.571/0.758), because both series trend upward during training and the raw figure
+overstates the association.
+
+**Verification:** Every quantitative claim in RESULTS_SECTION.md was re-checked against
+results/comparison_table.json and results/gate_analysis.json programmatically (7/7 spot
+checks exact). The r_t=0.5 mechanism prediction was computed independently
+(0.11857 predicted vs 0.11868 measured, diff 1.1e-4). Partial correlations recomputed from
+each run's trainer_state.json log_history. submit_all.sh dry-run confirms `3b v3` now
+submits one job and the no-argument default still submits exactly the 10-job matrix;
+bash -n passes.
+
+---
+
+### [2026-07-19 11:10] Correction: repetition_penalty=1.2 modifies HRPO Equation 3
+
+**File(s):** results/RESULTS_SECTION.md (threats to validity)
+
+**Change:** Corrected an earlier claim that v4 is methodologically identical to published
+HRPO. It is identical in architecture, loss, optimizer groups and modules_to_save, but the
+protocol's `repetition_penalty = 1.2` (spec Section 5; the HRPO paper Table 4 has no such
+parameter) is applied by the logits processor BEFORE the softmax whose output feeds both
+token selection and the Equation 3 projection
+(transformers/generation/utils.py:3328 -> 3351 -> 3369). The penalty therefore perturbs the
+latent vector h_{t+1} blended into the next input embedding, not just the sampled token.
+
+**Reason:** User challenged whether repetition_penalty could change the output. It can, and
+more deeply than stated: it alters the latent projection itself.
+
+**Quantified:** On a representative Qwen2.5-1.5B-shaped distribution (V=151936, D=1536,
+tau=0.5) with a 120-token context, penalty 1.2 vs 1.0 gives KL=0.434, cosine similarity
+0.9872 between projected vectors, and 15.98% relative L2 change in h_{t+1} — compounding
+over every think-span token.
+
+**Scope of impact:** All ten runs share repetition_penalty=1.2, so every within-study
+comparison (notably v3 vs v4, the central claim) remains internally valid. eval_gsm8k.py
+applies no penalty, so all reported accuracies are unaffected. Only the claim that v4
+reproduces *published* HRPO in absolute terms is weakened.
+
+**Recommended follow-up:** an additional 1.5B v4 run with `--repetition_penalty 1.0` to
+obtain a true published-HRPO cell; the legacy checkpoint (rp=1.0, 65.81%) exceeding v4
+(rp=1.2, 62.62%) is suggestive but confounded by group size 8 and 1024-token completions.
+
+**Verification:** Confirmed RepetitionPenaltyLogitsProcessor is constructed when the value
+!= 1.0 (transformers/generation/utils.py:976), traced the probs tensor from the processor
+into the Eq.3 einsum, and measured the projection change numerically with the real
+processor class.
+
+---
+
+### [2026-07-19 11:40] Reconciliation with published HRPO GSM8K numbers (results section 5.9)
+
+**File(s):** results/RESULTS_SECTION.md
+
+**Change:** Added section 5.9 reconciling this study's absolute accuracies with the HRPO
+paper's reported 0.720 (HRPO) / 0.711 (GRPO) on GSM8K at Qwen2.5-1.5B.
+
+**Findings:**
+1. The offset is SYSTEMATIC across arms: our GRPO is 8.6 points below the paper's GRPO and
+   our HRPO 9.4 below the paper's HRPO. A near-equal gap in both arms points at setup, not
+   at a failure to reproduce the gate.
+2. Diagnostics run against the saved eval responses rule out the obvious causes:
+   - training converged (v1 mean reward 0.124 -> 0.581; 3b v1 0.323 -> 0.780) and only
+     0.3% of steps had a zero-variance (no-signal) reward group;
+   - answer extraction is not the cause — a permissive "last number anywhere" scorer moves
+     accuracy by at most +1.4 points (v1 0.6247 -> 0.6346, v4 0.6262 -> 0.6406);
+   - truncation is rare (25-36 of 1319 responses long-and-untagged);
+   - the base model's 866/1319 missing-#### responses are a prompt-format handicap on the
+     UNTRAINED model only; trained models emit the delimiter (42-59 missing).
+   Two documented deviations remain unisolated: LoRA targets (paper adapts query/key/value/
+   dense = attention only; this study also adapts gate_proj/up_proj/down_proj) and
+   repetition_penalty=1.2.
+3. KEY: the RELATIVE GSM8K result replicates the paper. The paper's own significance
+   analysis (their Table 9, sampling-based paired t-test) gives GRPO 0.710 vs HRPO 0.712 at
+   1.5B, NOT marked significant — one of two tasks out of five where HRPO's gain fails to
+   reach significance for this backbone. Ours: 0.625 vs 0.626, McNemar p=0.950. The headline
+   Table 2 claim (0.711 -> 0.720) is a single greedy decode that the paper's own test does
+   not support.
+
+**Reason:** User flagged that the paper reports 0.720 for HRPO on GSM8K. The discrepancy
+needed resolving before the results could be defended.
+
+**Assumption (if any):** none — the paper's Table 9 bolding and its "significant in three out
+of five tasks" statement for the 1.5B backbone were read directly.
+
+**Verification:** All diagnostic numbers computed from the synced eval_results.json and
+trainer_state.json files (alternative-extraction scorer, truncation counts, missing-delimiter
+counts, reward trajectories, zero-variance step counts).
+
+---
+
+### [2026-07-19 12:15] Enable follow-up runs: seed-aware experiment dirs + --lora_targets
+
+**File(s):** variant_common.py, all six hrpo_*.py variant scripts
+
+**Change:** (1) `experiment_dir(model_size, variant_id, args)` now appends a suffix for any
+run departing from the main ablation: `-seed{N}` (seed != 42), `-rp{X}`
+(repetition_penalty != 1.2), `-lora{set}` (lora_targets != full). (2) Added `--lora_targets
+{full,attention}` and a `LORA_TARGETS` registry; all six variant scripts now take
+`target_modules = LORA_TARGETS[args.lora_targets]` instead of a hard-coded list, and pass
+`args` to `experiment_dir`. `lora_targets` added to the resume fingerprint.
+
+**Reason:** Planned follow-up experiments (seed replicates, 3B v3, v4 with rp=1.0, a faithful
+HRPO reproduction with the paper's attention-only LoRA) could not be run correctly without
+these. In particular a seed-43 replicate previously resolved to the SAME directory as the
+seed-42 run, hit exit_if_complete() and silently did nothing — the run would have appeared
+to succeed while producing no new training at all.
+
+**Assumption (if any):** "full" (attention+MLP) remains the default so every completed run's
+path and configuration are unchanged; "attention" (q/k/v/o) matches HRPO paper Table 4's
+"query, key, value, dense".
+
+**Verification:** Parameterised check of all five configurations: defaults still resolve to
+./experiments/1.5b-v3_learned_lambda and ./experiments/1.5b-v4_full_hrpo_gate (so the ten
+completed runs are still detected and skipped), while seed/rp/lora overrides each produce a
+distinct directory; LORA_TARGETS yields 7 modules for "full" and 4 for "attention". All six
+scripts + variant_common pass py_compile.
+
+---
+
+### [2026-07-19 12:40] Follow-up run submission + run_ablations.sh path bug fix
+
+**File(s):** run_ablations.sh, cluster/run_variant.slurm, cluster/submit_followups.sh (new)
+
+**Change:** (1) run_ablations.sh now derives the experiment directory by calling
+variant_common.experiment_dir with the parsed extra args, instead of hard-coding
+"experiments/{size}-{variant_id}". (2) run_variant.slurm forwards an optional EXTRA_ARGS
+environment variable (propagated by sbatch --export=ALL) into run_ablations.sh after `--`.
+(3) Added cluster/submit_followups.sh submitting Tier 1 (seed 43/44 replicates of v3 and v4
+at 1.5B, 4 jobs), Tier 3 (faithful published-HRPO reproduction: repetition_penalty 1.0 +
+attention-only LoRA, 1 job) and Tier 3b (single-factor control: repetition_penalty 1.0 only,
+1 job), selectable as `bash cluster/submit_followups.sh [tier1|tier3|all]`.
+
+**Reason:** BUG — run_ablations.sh computed the skip-check path without the seed / penalty /
+LoRA suffix, so every follow-up run would have checked the COMPLETED main-ablation directory,
+reported "SKIP ... (completed checkpoint exists)" and exited without training. All six
+planned follow-up jobs would have silently done nothing.
+
+**Assumption (if any):** EXTRA_ARGS is intentionally unquoted at the call site so it
+word-splits into separate arguments; values contain no commas, so sbatch --export parsing is
+unaffected (the variable is passed via ALL rather than in the export list).
+
+**Verification:** Probe reproducing run_ablations.sh's new derivation returns
+experiments/1.5b-v3_learned_lambda for defaults, -seed43 / -rp1 / -rp1-loraattention for the
+overrides; experiment_is_complete then reports SKIP for the completed main run and RUN for
+both follow-up directories — i.e. the follow-ups will now actually train. Dry-run of
+submit_followups.sh lists the expected 6 jobs with correct per-job EXTRA_ARGS. bash -n passes
+on all three scripts.
+
+---
+
+### [2026-07-19 13:05] BUG FIX: analysis pipeline ignored all follow-up run directories
+
+**File(s):** variant_common.py (parse_experiment_name), eval_all.py, analyse_gate.py
+
+**Change:** Added `EXPERIMENT_NAME_RE` / `parse_experiment_name(name) -> (size, base_variant,
+suffix)` to variant_common and switched eval_all.discover_experiments and
+analyse_gate.find_experiments to use it. Discovered runs now carry both `variant_id`
+(base + suffix, so replicates and controls are distinguishable rows) and `base_variant`
+(used to look up the gate mode and chain membership).
+
+**Reason:** The previous discovery regexes (`^(0\.5b|1\.5b|3b)-(v\d_[a-z_]+)$`) do not match
+suffixed directories. The six follow-up jobs submitted today (jobs 13319-13324) write to
+`1.5b-v3_learned_lambda-seed43`, `...-seed44`, `1.5b-v4_full_hrpo_gate-rp1`,
+`...-rp1-loraattention` etc., all of which would have been SILENTLY IGNORED by eval_all.py
+and analyse_gate.py — 6 x ~17h of training would have completed and never been evaluated.
+
+Equally important, the gate mode must be resolved from the BASE variant: a naive fix that
+keyed GATE_MODES on the full suffixed id would fall through to the "standard" default and
+evaluate the v3 seed replicates with the stock gate instead of the unit-gate patch, silently
+producing wrong accuracies for them.
+
+**Assumption (if any):** The suffix grammar is fixed by experiment_dir() to
+`-(seed|rp|lora)...`, so the regex anchors on those three prefixes and cannot mistake a
+legacy or unrelated directory for an ablation run.
+
+**Verification:** Parameterised test over six directory names covering plain, seed, rp,
+combined rp+lora and 3B cases: all parse to the correct base variant, suffix and gate mode
+(v3 replicates correctly resolve to gate_mode="unit"). Non-experiment names
+("Qwen2.5-1.5B-Instruct-gsm8k-group8", "results") correctly return None. Regression:
+`eval_all.py --skip_eval` still rebuilds the existing 14-row comparison table unchanged.
+
+---
+
+### [2026-07-19 15:20] Print-quality figure fixes (3 figures)
+
+**File(s):** analyse_gate.py (gradient_flow, plot8_heatmaps), generate_report.py
+(fig_ablation_bars)
+
+**Change:**
+1. **gate_gradient_flow_{size}.png** — now plots the PRE-CLIP reconstructed norms instead of
+   the raw post-clip logged values, with the y-label and subtitle updated to say so. Verified:
+   the plotted v3-vs-v4 Λ ratio is now 8.7x, matching the prose; previously the figure showed
+   3.4x and visibly contradicted the text.
+2. **ablation_accuracy_by_size.png** — converted from a bar chart to a point-estimate +
+   CI-whisker (dot) plot with the y-axis zoomed to the data range, plus a dotted GRPO-baseline
+   reference line per panel and an explicit "note truncated axis" subtitle. Sizes holding only
+   a legacy row no longer get an empty panel (the 0.5b panel was also stretching the shared
+   y-range).
+3. **gate_p8_activation_heatmap_{size}.png** — every row is now resampled to a common width
+   (200 columns, x = position as a fraction of the think span), so bar LENGTH no longer varies
+   with response token count. Subtitle states that uniform colour within a row is the finding,
+   and x ticks are labelled start / end of think span. The per-token hidden-ratio series is now
+   persisted in gate_analysis.json so the figure can be restyled later without a GPU re-run.
+
+**Reason:** Review of the figures for print. (1) the figure contradicted the text's 8.7x claim
+because post-clip norms are not comparable across runs — each run has its own clipping factor
+c = min(1, max_grad_norm / total_norm). (2) a [0,1] axis made the 4.55-point headline effect
+nearly invisible. (3) with per-token variance ~0 the heatmap renders as solid bars of differing
+lengths, inviting readers to compare lengths (which encode only response length — e.g. Q5 where
+v4 is longer) rather than colour.
+
+**Assumption (if any):** For (2) the reviewer suggested truncating the bar chart's y-axis to
+[0.55, 0.90]. Truncating a BAR axis is a recognised misleading-chart pattern, because bar
+length encodes magnitude and must start at zero. Converting to a dot plot achieves the same
+readability legitimately, since position rather than length encodes the value; the axis range
+is derived from the plotted CIs rather than hard-coded.
+
+**Verification:** Gradient-flow figure regenerated locally; plotted ratio confirmed at 8.7x
+(pre-clip 8.883e-03 vs 1.018e-03) against 3.4x before, and the within-v4 gate-to-Λ ratio is
+unchanged at ~2.3x as expected since clipping cancels within a panel. Accuracy figure
+regenerated and visually inspected: v3's separation from the baseline line is now clearly
+legible, no empty panel, title no longer collides with panel headings. Heatmap resampling
+unit-tested on the real ragged shapes (14-token v2 row vs 512-token v4 row): both resample to
+exactly 200 columns. Plot 8 itself still needs a GPU re-run to regenerate the image
+(`python analyse_gate.py --dynamic --model_size 1.5b`), which is already part of the pending
+follow-up analysis pass.
+
+---
+
+### [2026-07-25 12:00] Control runs overturn the single-seed headline
+
+**File(s):** results/DISSERTATION_WRITING_PROMPT.md, results/RESULTS_SECTION.md (both:
+correction banner + control-run section)
+
+**Change:** Recorded that the seed replicates and repetition-penalty toggle overturn the
+original "v3 > v4 / input gate hurts" headline and softened both writing documents so the
+dissertation chapter is not built on the superseded claim.
+
+**Findings (all 1.5B, GSM8K, n=1319, greedy):**
+- Seed replicates: v3 {67.02, 63.68, 62.47} mean 64.39 spread 4.55; v4 {62.62, 63.53, 60.73}
+  mean 62.29 spread 2.81. Ranges OVERLAP (v3-seed44 62.47 < v4-seed43 63.53). All six seed
+  runs trained normally (checked reward trajectories; v3-seed44 had highest end reward 0.594,
+  hidden ratio 0.167). The seed-42 +4.55/-4.40 effect does not replicate.
+- Repetition penalty (paired McNemar, seed 42): v4 rp1.2 62.62 -> rp1.0 67.40 (+4.78,
+  p=0.0006), converged training reward 0.459 -> 0.846; rp1.0 + attention-only LoRA 67.70
+  (+0.30 vs rp1.0, p=0.84 — LoRA change negligible). v3(rp1.2) 67.02 vs v4(rp1.0) 67.40 tied
+  (p=0.82). Gap to the paper's 0.720 falls 9.38 -> 4.30 points; the penalty was essentially
+  all of it.
+- Corrected position: the input-gate "harm" was the protocol's repetition_penalty=1.2
+  (absent from the paper) interacting with the gated path and perturbing the Eq.3 projection,
+  compounded by seed variance — not the gate architecture. The "simplified HRPO is a
+  principled improvement" claim is NOT supported.
+
+**Assumption (if any):** none — all numbers computed directly from the synced
+eval_results.json / trainer_state.json of the six follow-up runs.
+
+**Open experiment:** v3 exists only at rp=1.2. The decisive missing cell is v3 at rp=1.0
+(x3 seeds), to compare the gate cleanly against v4-rp1.0. Until then the input-gate question
+is reported as open.
+
+**Verification:** Seed means/ranges, paired McNemar (v4 rp1.2 vs rp1.0 chi2=11.76 p=6.1e-4;
+v4-rp1.0 vs v4-rp1.0-attn chi2=0.04 p=0.84; v3 vs v4-rp1.0 chi2=0.05 p=0.82) and reward
+trajectories all recomputed from the local synced files.
+
+---
+
+### [2026-07-25 12:40] Tier 4 level-field gate runs + analyse_replicates.py
+
+**File(s):** cluster/submit_followups.sh (tier4 block), analyse_replicates.py (new),
+cluster/run_eval_and_analysis.slurm (added step 4b)
+
+**Change:**
+1. Added a `tier4` block to submit_followups.sh: v3 at rp=1.0 for seeds 42/43/44 and v4 at
+   rp=1.0 for seeds 43/44 (v4 rp=1.0 seed 42 already exists and is skipped) — 5 jobs. This
+   completes v3 and v4 each at rp=1.0 with 3 seeds, so v3-rp1.0 vs v4-rp1.0 becomes the clean
+   level-field test of whether the input gate helps/hurts/is neutral once the confounding
+   repetition penalty is removed from both arms.
+2. Added analyse_replicates.py: groups every experiment dir into an *arm* keyed by
+   (size, base variant, repetition_penalty, lora_targets) via parse_experiment_name +
+   parse_suffix; reports per-arm mean/min-max/per-seed accuracy, and per-seed paired McNemar
+   for the gate test (v4 vs v3 at each rp) and the penalty effect (rp1.2 vs rp1.0 within a
+   variant), distinguishing the paired-shared-seed delta from the arm-mean delta. Saves
+   results/replicate_analysis.json + results/plots/replicate_summary.png (mean with min-max
+   range bars). Pure JSON/stats, no GPU. Wired into run_eval_and_analysis.slurm as step 4b.
+
+**Reason:** The control runs showed the input-gate comparison is confounded by the
+repetition penalty and inflated by seed 42; tier4 supplies the missing v3-rp1.0 cell, and
+analyse_replicates.py reports the replicated comparison the single-seed comparison_table
+cannot.
+
+**Assumption (if any):** rp-suffix is written with %g, so a directory ending "-rp1" denotes
+rp=1.0; parse_suffix decodes seed/rp/lora with the ablation defaults (42 / 1.2 / full).
+
+**Verification:** tier4 dirs resolve to 1.5b-v3_learned_lambda-rp1, -seed43-rp1, -seed44-rp1,
+and 1.5b-v4_full_hrpo_gate-{seed43,seed44}-rp1 — all new, and v4 rp1.0 seed42 correctly
+reports EXISTS (skips). analyse_replicates.py run on current local data reproduces the
+seed-42-only significance of the gate test (seed42 p=.0006*, seed43 p=.95, seed44 p=.13;
+Δ paired = −2.10 pts) and the penalty effect (v4 rp1.2→rp1.0 +4.78 pts, p=.0006, seed 42);
+figure renders with v3/v4 rp1.2 ranges overlapping and both rp1.0 arms clearly higher.
+bash -n passes on both cluster scripts; tier4 dry-run lists exactly 5 jobs.
+
+---
+
+### [2026-07-25 13:20] Supervisor-facing summary of first-run findings & confounds
+
+**File(s):** results/SUPERVISOR_SUMMARY.md (new)
+
+**Change:** Wrote a slide-ready (5-slide) summary for the supervisor covering: the first-run
+apparent headline (v3 > v4, gate hurts), why it does NOT survive (seed variance + the
+repetition_penalty=1.2 confound), the protocol drift from the paper that caused it, what still
+stands, and the decisive v3/v4 rp=1.0 test now queued. Numbers cross-checked against
+comparison_table.json, gate_analysis.json and the per-run eval_results.json.
+
+**Reason:** User requested a slide for their supervisor summarising the findings and problems
+with the first run.
+
+**Note:** All prior code changes this session (control-run analysis, tier4 runs,
+analyse_replicates.py, figure fixes) were already logged in the entries above; changes.md was
+current before this entry.
+
+**Verification:** Every accuracy in the summary reproduced from source within 5e-4
+(v1 62.47, v3 67.02, v4 62.62, v4-rp1 67.40, v4-rp1-attn 67.70, 3b v6 74.91, 3b base 75.28);
+seed means/ranges match (v3 64.4 [62.5,67.0], v4 62.3 [60.7,63.5], ranges overlap).
+
+---
+
+### [2026-07-25 21:00] Tier 4 result (gate is neutral) + tier 5 fair baselines; supervisor summary updated
+
+**File(s):** results/SUPERVISOR_SUMMARY.md (rewritten slides 3-6), cluster/submit_followups.sh
+(tier5 block)
+
+**Change:** Tier 4 (v3 & v4 at rp=1.0, 3 seeds) completed and analysed. Result:
+- Level-field gate test v3 vs v4 at rp=1.0: v3 mean 70.48 {71.65,68.69,71.11}, v4 mean 70.05
+  {67.40,70.81,71.95}. Paired Δ = -0.43 pts, per-seed signs MIXED (seed42 favours v3 -4.25
+  p=.0003; seeds 43/44 favour v4 +2.12/+0.83, n.s.). => the input gate is NEUTRAL; the run-1
+  "gate hurts" was a seed-42 + penalty artifact.
+- Penalty effect replicated across all seeds, all p<0.001: v3 +6.09 mean {+4.62,+5.00,+8.64},
+  v4 +7.76 mean {+4.78,+7.28,+11.22}. The repetition_penalty=1.2 was crippling the whole
+  latent family, not just the gate.
+Rewrote SUPERVISOR_SUMMARY.md to reflect the resolved result (gate neutral; penalty was the
+confound; HRPO simplifies to learned-Λ at no cost). Added a tier5 block to submit_followups.sh
+(v1 and v2 at rp=1.0, 3 seeds each = 6 jobs) — the baselines were only run at rp=1.2, so the
+fair "does HRPO beat GRPO at rp=1.0" comparison needs them; v1 has no Eq.3 projection so may
+gain far less from the penalty removal.
+
+**Reason:** The decisive control test resolved the gate question; the documents and the next
+experiment must reflect it.
+
+**Assumption (if any):** none — all numbers from results/replicate_analysis.json and the
+per-run eval_results.json.
+
+**Verification:** analyse_replicates.py rerun on the full tier-4 data; arm means and the
+gate@rp1.0 paired delta reproduced; supervisor-summary figures cross-checked. tier5 dirs
+resolve to 1.5b-v{1,2}_*-rp1[/-seedN] (all new); bash -n passes.
+
+---
+
+### [2026-07-25 22:30] rp=1.0-primary reporting + cleanup.sh; v5/v6 seed gap noted
+
+**File(s):** generate_report.py (table0_primary + fig_primary_rp; table1/accuracy-fig
+relabelled secondary), cluster/cleanup.sh (new)
+
+**Change:**
+1. generate_report.py now emits a PRIMARY result as Table 0 + accuracy_primary_rp.png:
+   per (size, base variant) the seed-averaged accuracy at rp=1.0 (corrected) vs rp=1.2
+   (confounded), mean with min-max range, built by grouping runs into arms
+   (analyse_replicates.discover_arms, 'full' LoRA only). The existing Table 1 and
+   ablation_accuracy_by_size.png are RETAINED but retitled as the rp=1.2 decomposition
+   (secondary), with captions cross-referencing Table 0 and noting the whiskers there are
+   within-run Wilson CI, not seed spread. Filled marker = rp1.0, hollow = rp1.2; the figure
+   self-documents pending cells (v1/v2 1.5b fill in after tier5; v5/v6 and all 3B have no
+   rp1.0 yet).
+2. Added cluster/cleanup.sh: for COMPLETE experiments only, deletes non-final checkpoints and
+   the survivor's optimizer/scheduler/rng state (resume-only); keeps adapter, eval_results,
+   trainer_state, gradient_log. Dry-run by default; --apply to delete. Incomplete/running
+   dirs are skipped (their optimizer state is needed for resume).
+
+**Reason:** User asked for rp=1.0 to be the headline (retaining rp=1.2 as the confound
+evidence, NOT deleting it) and for a safe disk-cleanup path. Also flagged that v5/v6 were
+never seeded — correct: the follow-up tiers were scoped to the central gate question and the
+confound; v5/v6 (reward shaping) currently rest on a single seed at the confounded rp=1.2
+setting, the same fragility the v3/v4 headline had.
+
+**Assumption (if any):** rp=1.0 is treated as the corrected/primary setting per the paper;
+rp=1.2 retained as the study protocol's confounded setting. Nothing is deleted from the data
+of record.
+
+**Verification:** generate_report.py runs: table0_primary_results.tex + accuracy_primary_rp.png
+produced; v3 rp1.2 64.4[62.5,67.0] vs rp1.0 70.5[68.7,71.7] (Δ+6.1), v4 62.3[60.7,63.5] vs
+70.1[67.4,72.0] (Δ+7.8) — matches replicate_analysis. Figure rendered and visually checked
+(group separator, legible labels, filled/hollow markers correct). cleanup.sh bash -n passes.
+
+**Open (recommended tier 6):** seed + rp=1.0 replicates of v5/v6 so the "reward shaping hurts"
+claim is on the same footing as the (now solid) gate claim. Not yet added to
+submit_followups.sh pending user decision.
+
+---
+
+## [2026-08-03 00:30] Tier-5 results in — control matrix settled; narrative docs corrected
+
+**What:** Tier-5 (v1 GRPO, v2 fixed blend at rp=1.0, 3 seeds each, 1.5B) trained, evaluated
+on the cluster, and synced back. The eval/analysis pipeline ran with the new report code:
+`table0_primary_results.tex`, `accuracy_primary_rp.png`, `replicate_analysis.json` all
+regenerated (Aug 3 00:18) and now include the v1/v2 rp=1.0 arms. Updated RESULTS_SECTION.md
+(banner + §5.11) and SUPERVISOR_SUMMARY.md (slides 5 + 6) to reflect the settled matrix.
+
+**Final 1.5B numbers at the faithful setting (rp=1.0, 3 seeds, mean):**
+v1 GRPO 69.72 | v2 fixed blend 70.20 | v3 learned Λ 70.48 | v4 full gate 70.05 — all inside a
+0.76-pt band, CIs overlap. Δ from removing rp=1.2: v1 +7.25, v2 +6.82, v3 +6.09, v4 +7.76.
+
+**Two settled conclusions:**
+  1. The input-dependent gate is NEUTRAL (v3 70.48 ≈ v4 70.05; per-seed signs mixed). The
+     seed-42 "gate hurts" headline was a confounded seed draw.
+  2. HRPO does NOT beat GRPO on GSM8K/1.5B at faithful hyperparameters (v1 ≈ v2 ≈ v3 ≈ v4).
+     Neither the Eq.3 projection nor the gate moves accuracy measurably.
+
+**Mechanism correction (important):** the rp=1.2 penalty lifts the non-latent GRPO baseline
+(v1, +7.25) AS MUCH AS the latent variants (v3 +6.09, v4 +7.76). So the confound is a GENERAL
+rollout-quality degradation, NOT a latent-projection-specific perturbation. The §5.10 "~16% L2
+perturbation of Eq.3" is real but second-order — corrected the overclaim in both docs (banner,
+§5.11(c), supervisor slide 5 penalty row, slide 6).
+
+**Reason:** Tier-5 was the last open cell (fair GRPO baseline at rp=1.0). It closes the
+"does HRPO beat GRPO?" question and, unexpectedly, simplifies the mechanism story.
+
+**Note on sync:** only results/ came back in the sync, not the per-dir experiments/*/
+eval_results.json — the analysis JSONs (replicate_analysis.json etc.) carry all the numbers,
+so nothing is missing for reporting, but the tier-5 eval_results.json files live only on the
+cluster if per-dir provenance is later wanted locally.
+
+**Still open (unchanged):** v5/v6 remain single-seed at rp=1.2 (recommended tier 6); 3B is
+single-seed rp=1.2 only; RESULTS_SECTION §5.1–5.10 body still leads with the superseded
+single-seed headline behind its banner (full body rewrite not yet done — flagged to user).
+
+---
+
+## [2026-08-04] Move the ENTIRE study to rp=1.0; no rp=1.2 in any plot
+
+**Why:** User directive — "rewrite the results ... steer away from rp=1.2 ... i dont want ANY
+plots to have rp=1.2 ... focus on the normal ablations." rp=1.0 is now THE reported setting;
+the repetition penalty is demoted to a one-paragraph methods note. User chose (via
+AskUserQuestion) to (a) regenerate the gate/failure diagnostics at rp=1.0, and (b) run v5/v6
+and the 3B chain at rp=1.0 first so the whole chain is clean.
+
+**Run infrastructure (cluster/submit_followups.sh):**
+  - tier6 = 1.5B v5,v6 at rp=1.0 x seeds {42,43,44} (6 jobs) — completes the 1.5B chain v1..v6.
+  - tier7 = 3B v1,v2,v3,v4,v6 at rp=1.0 x SEEDS (default {42,43,44} => 15 jobs; throttle with
+    SEEDS=42). Both gated on explicit tier name only (NOT "all") so the expensive 3B set is
+    never launched by accident. Added SEEDS env override.
+
+**Analysis made rp=1.0-aware:**
+  - analyse_gate.py: new module global TARGET_SUFFIX + --variant_suffix. With "-rp1",
+    find_experiments keys the -rp1 dirs by their BARE variant, so every plot reads the rp=1.0
+    checkpoint and OVERWRITES the identically-named figure. Default "" = old rp=1.2 behaviour.
+  - analyse_failures.py: infer_tag now strips the follow-up suffix (via parse_experiment_name)
+    so rp=1.0 failure figures/keys overwrite the rp=1.2 ones cleanly (setting-agnostic names).
+  - cluster/run_eval_and_analysis.slurm: new ANALYSIS_SUFFIX env (default "-rp1"). Threads
+    --variant_suffix into analyse_gate and globs ${SIZE}-${VAR}${ANALYSIS_SUFFIX} for failure
+    analysis. eval_all + analyse_replicates still process every run. Set ANALYSIS_SUFFIX="" to
+    revert diagnostics to the rp=1.2 main cells.
+
+**generate_report.py — rp=1.0-only reporting:**
+  - table0_primary: rewritten to the rp=1.0 ablation chain (accuracy seed-mean [range] +
+    Δ vs GRPO); rp=1.2 column removed; penalty stated once in the caption.
+  - Removed fig_primary_rp (dual rp=1.2/1.0), fig_ablation_bars (rp=1.2), fig_scale_lines
+    (rp=1.2). Added fig_ablation_rp1 -> canonical ablation_accuracy_by_size.png (rp=1.0 only,
+    per-size seed-mean + min-max whiskers, GRPO baseline line) and fig_scale_rp1 ->
+    scale_vs_accuracy.png (rp=1.0, drawn only when >=2 sizes present).
+  - main() deletes stale rp=1.2-bearing figures accuracy_primary_rp.png and
+    replicate_summary.png after regeneration.
+
+**RESULTS_SECTION.md:** fully rewritten around rp=1.0. Preamble states rp=1.0 is the setting;
+§6.1 headline = the 1.5B null result (v1..v4 tie ~70, gate neutral); §6.2 component walk;
+§6.3 mechanism (regenerated at rp=1.0); §6.4 reward shaping + §6.7 3B marked [pending rp=1.0];
+§6.8 reconciliation (v4 rp=1.0 70.05 within ~2 pts of paper 0.720); §6.9 the penalty as a
+methods note (uniform ~7pt hit incl. baseline => general degradation, not latent-specific).
+v1..v4 @ 1.5B numbers filled; v5/v6/3B/mechanism-values marked pending the tier6/7 runs.
+
+**Follow-up (NOT done):** SUPERVISOR_SUMMARY.md still embeds replicate_summary.png (now
+deleted) on slides 3-4 — its figure references need updating once the deck is rebuilt around
+the rp=1.0 story. Flagged to user.
+
+---
+
+## [2026-08-09] BUGFIX — gate analysis silently skipped at rp=1.0 (argparse)
+
+**Symptom:** cluster run 14279 .err: `analyse_gate.py: error: argument --variant_suffix:
+expected one argument` for the static + both dynamic gate calls → all three skipped. Result:
+gate_*.png and gate_analysis.json were NOT regenerated at rp=1.0; they remained STALE rp=1.2
+from a prior run. (Accuracy tables + failure analysis were unaffected — those use a shell glob
+on ANALYSIS_SUFFIX, not argparse.)
+
+**Cause:** the slurm passed `--variant_suffix "$ANALYSIS_SUFFIX"` with ANALYSIS_SUFFIX="-rp1".
+argparse reads the leading '-' of "-rp1" as the start of another option and aborts. Verified:
+`--variant_suffix -rp1` FAILS, `--variant_suffix=-rp1` OK.
+
+**Fix:** cluster/run_eval_and_analysis.slurm now uses the `=` form
+`--variant_suffix="$ANALYSIS_SUFFIX"` for both the --static and --dynamic gate calls. Empty
+("") still resolves to the rp=1.2 default. Needs sync-up + re-run to regenerate the gate
+figures/JSON at rp=1.0.
+
+**Data state at time of fix:** 1.5B accuracy (table0 + replicate_analysis) correct at rp=1.0,
+3 seeds, v1-v6 (v5=70.58, v6=69.29 — reward shaping NOT harmful at rp=1.0; all six tie
+69.3-70.6). 1.5B failure analysis correct at rp=1.0. Gate diagnostics STALE (this bug). 3B
+still rp=1.2 (tier7 pending).
+
+---
+
+## [2026-08-09] Scope study to 1.5B for now; fill settled v1–v6 rp=1.0 story
+
+**Why:** User — "for now I just want to focus on 1.5b." 3B exists only at rp=1.2 (tier7 not
+run), so it is deferred; no 3B cell reported.
+
+**Size scoping (reversible via one env var):**
+  - SIZES in eval_all.py / analyse_gate.py / generate_report.py now read
+    os.environ["HRPO_SIZES"] (default "0.5b 1.5b 3b").
+  - run_eval_and_analysis.slurm: exports HRPO_SIZES (default "1.5b"), threads it to
+    eval_all --sizes, analyse_gate --sizes, the dynamic-gate + failure loops, and
+    hrpo_overhead --matrix_sizes. To bring 3B back later: HRPO_SIZES="1.5b 3b".
+  - Pipeline now also `rm -f results/gate_analysis.json results/failure_analysis.json` at
+    start (these MERGE across runs, so a stale 3B rp=1.2 entry would otherwise linger).
+
+**Settled 1.5B rp=1.0 result (all n=3):** v1 69.72, v2 70.20, v3 70.48, v4 70.05, v5 70.58,
+v6 69.29 — ALL SIX tie inside a 1.29-pt band. Reward shaping (v5/v6) is NEUTRAL, not harmful:
+the earlier v5=58.98 / v6=63.23 collapse was ALSO an rp=1.2 artifact. Strongest form of the
+null result: no HRPO component or reward term moves accuracy at 1.5B once faithful.
+
+**RESULTS_SECTION.md:** filled §6.1 (Table 1 = 1.5B v1-v6, dropped 3B column), §6.2 (component
+walk v4->v5 +0.53, v5->v6 -1.29), §6.4 (reward shaping neutral, rewritten), §6.5 (1.5B failure
+confusion matrix from rp=1.0 seed-42: v4 797/92/106/324, v6 793/106/110/310; ~95% wrong-answer-
+correct-format, repetition loops ~0). §6.6 dropped 3B overhead row. §6.7 scale = deferred.
+Status box + threats updated to "1.5B settled, 3B deferred". §6.3 mechanism still needs the
+fixed gate re-run (argparse bug) before its exact rp=1.0 numbers land.
+
+---
+
+## [2026-08-10] BUGFIX — generate_report clobbered rp=1.0 Λ figures with rp=1.2
+
+**Symptom (found via mtimes):** after a full pipeline run the DYNAMIC gate plots (p1/p7/p8,
+heatmap) were rp=1.0 (correct) but the STATIC Λ figures (p2 dist, p3/p4 ratios, p6 reward-
+ratio, gradient flow) + gate_analysis.json Λ entries were rp=1.2 — their recorded checkpoints
+were `1.5b-vX/checkpoint-934` (no -rp1) and Λ-CV values matched the old rp=1.2 table exactly.
+gate_p2 (20:40) was newer than gate_p8 (20:30), i.e. static ran AFTER dynamic — impossible in
+one pipeline pass.
+
+**Cause:** generate_report.ensure_static_gate_plots() called
+`analyse_gate.run_static(Namespace(sizes=SIZES))` UNCONDITIONALLY and WITHOUT a variant_suffix,
+so analyse_gate.TARGET_SUFFIX stayed "" (rp=1.2). Running at step 5 (report), it overwrote the
+pipeline's step-2 rp=1.0 static Λ figures with the rp=1.2 main cells.
+
+**Fix:**
+  - ensure_static_gate_plots() now (1) SKIPS when the static figures already exist (the
+    pipeline's explicit `analyse_gate --static --variant_suffix=-rp1` produced them), and
+    (2) if it must regenerate, sets analyse_gate.TARGET_SUFFIX = os.environ["ANALYSIS_SUFFIX"]
+    (default "-rp1") instead of the rp=1.2 default.
+  - run_eval_and_analysis.slurm now `export`s ANALYSIS_SUFFIX so the fallback can read it.
+
+**State:** dynamic gate plots already rp=1.0; after sync-up + one clean pipeline re-run the
+static Λ figures/JSON will also be rp=1.0. Verify: plot2 checkpoint path should read
+`experiments/1.5b-vX_*-rp1/checkpoint-934`.
+
+---
+
+## [2026-08-10] INCIDENT + recovery — `rsync --delete` removed hand-written docs; §6.3 filled
+
+**Incident:** the recommended sync-back `rsync -av --delete .../results/ .../results/` deleted
+results/RESULTS_SECTION.md, results/SUPERVISOR_SUMMARY.md, results/DISSERTATION_WRITING_PROMPT.md
+— they are hand-written (not pipeline outputs) and don't exist on the cluster, so --delete
+purged them locally. They were untracked in git (no git recovery).
+
+**Recovery:** reconstructed all three by replaying their Write + subsequent Edit ops from the
+session transcript JSONL (deterministic); restored to results/. RESULTS_SECTION.md and
+SUPERVISOR_SUMMARY.md were also in-context; DISSERTATION_WRITING_PROMPT.md was recoverable
+ONLY from the transcript.
+
+**Prevention (safe sync pattern going forward):** scope --delete so it can't touch the docs:
+    rsync -av --delete --exclude '*.md' \
+      ztay632@foscsmlprd01.its.auckland.ac.nz:/data/ztay632/Dissertation-HRPO/results/ \
+      /home/zacht/Dissertation-HRPO/results/
+(--delete still purges stale plots; excluded *.md docs are protected from deletion.) Better:
+git-track the three docs so any future loss is recoverable.
+
+**Also this turn:** gate clobber fix confirmed working — static Λ figures now rp=1.0 (plot2
+checkpoints read -rp1; static 21:23 precedes dynamic 21:33). Filled RESULTS_SECTION §6.3 with
+the verified rp=1.0 mechanism numbers: gate activation variance 0.000; token-category ratios
+0.11867–0.11871 (identical); final hidden ratio v3 0.1671 -> v4 0.1187; Λ CV 0.288 vs frozen
+0.300; Λ gradient 4.6x less in v4, gate/Λ grad ratio 2.5x; reward–ratio Pearson r 0.58.
+The 1.5B RESULTS section (§6.1–6.10) is now complete.
+
+---
+
+## [2026-08-10] Complete rewrite of the three results docs (settled 1.5B rp=1.0 story)
+
+Backed up the recovered docs first (scratchpad/docs_backup_*), then fully rewrote:
+  - results/RESULTS_SECTION.md — coherent §6.1–6.9 around the six-arm null result; every
+    number rp=1.0; mechanism (§6.3), reward-shaping-neutral (§6.4), failure (§6.5), overhead
+    (§6.6), penalty confound as methodological result (§6.7), reconciliation (§6.8).
+  - results/SUPERVISOR_SUMMARY.md — 5 slides around the settled null result; embeds only
+    figures that exist at rp=1.0 (ablation_accuracy_by_size.png, gate_p8_..._1.5b.png); the
+    old superseded "v3>v4 / 3B / replicate_summary.png" deck is gone.
+  - results/DISSERTATION_WRITING_PROMPT.md — self-contained prompt rebuilt around null result
+    + methodological finding; corrected file/figure attach list (removed scale_vs_accuracy,
+    noted gate_p3/p5 collapse to a point while 1.5B-only).
+Fixed a pre-clip Λ gradient magnitude typo (v4 0.6×10⁻³ not 1.0×10⁻³; ratio 4.6×). Swept all
+three for stale numbers (2×10⁻⁵, 8.7×, 0.447, 62.62, 67.02, "pending") — none remain.
+
+NOTE: these three docs are UNTRACKED in git — that is why the earlier `rsync --delete` could
+destroy them. Recommend `git add`+commit to make them durable.
+
+---
+
+## [2026-08-13] Verified gate-mechanism provenance; fixed key_findings false flags + naive interpretations
+
+**Trigger:** review flagged that key_findings.txt said gate diagnostics "may predate the -rp1
+remap" — the "gate is a constant" claim is load-bearing and must be on rp=1.0 checkpoints.
+
+**Verification (ground truth):** every checkpoint path in results/gate_analysis.json is
+`-rp1` (v2..v6 → experiments/1.5b-*-rp1/checkpoint-934); plot1 sample accuracy = 0.705 (rp=1.2
+would be ~0.62); static plots (21:23) precede dynamic (21:33) = one clean pipeline run. The
+gate mechanism numbers in RESULTS_SECTION.md ARE rp=1.0. RESULTS_SECTION needed no change.
+
+**Root cause of the flag:** analyse_gate.py:182 writes a top-level `_source_suffix` marker, but
+that code postdates the current gate_analysis.json, so the marker is absent and
+generate_report._stale_note defaulted to "most likely rp=1.2".
+
+**Fixes (generate_report.py):**
+  - key_findings now infers a section's provenance from its recorded checkpoint paths when
+    `_source_suffix` is absent (`_suffix_from_checkpoints`) — resolves plot2 → -rp1 without a
+    re-run; dynamic sections (no paths) still need the marker (one analyse_gate run writes it).
+  - RQ4 interpretation: replaced bare `num>word` (flagged a 1e-5 noise gap as "numbers higher")
+    with a 1e-3 threshold → "identical, not content-sensitive".
+  - RQ5 interpretation: replaced hardcoded "CV >> 0 = specialisation" with a comparison to the
+    frozen-init reference v2 → "spread is initialisation, NOT specialisation".
+
+**Current artifact:** hand-corrected results/key_findings.txt (5 false provenance flags → VERIFIED
+rp=1.0; RQ4/RQ5 interpretations → correct null) with a correction banner; will regenerate clean
+after one analyse_gate run. Documented in HANDOVER.md §8 gotcha #7.
+
+---
+
+## [Stage 0 brief — Phase 1] Discovery report (read-only, no code changes)
+
+1. **r_min:** flag `--residual_r_min` (default 0.98) / `--residual_r_max` (0.999),
+   variant_common.py:75-76. Init at modeling_qwen2.py:476-483 —
+   `uniform_(Lambda, r_min, r_max)` then `Lambda = -log(Lambda^(-1/c) - 1)`, c=8.
+   Existing 1.5b-v3/-v4 `-rp1` runs used **r_min=0.98** (read from run_config.json, not
+   inferred). Brief proposed 0.95 → CONFLICT; human decision: **match existing (0.98)**.
+2. **Think span:** generation/utils.py:3368 `is_thinking = [self.answer_start not in s for s in strs]`
+   with `ANSWER_START = "####"` (utils.py:4). Span = everything before the literal `####`
+   appears in the decoded string, recomputed per decode step, per sequence (string-level,
+   NOT tag/token-id delimited). Mask accumulated at L3289/3376/3419, returned by generate L3425.
+3. **Blend in a plain forward:** TWO paths. Generation computes Eq.3 inline at
+   utils.py:3369-3372 (`einsum('bv,vd->bd', probs, embed_tokens.weight) / ||probs||`, with
+   `probs = softmax(next_token_scores)` AFTER logits processors — the mechanical source of the
+   repetition-penalty contamination) and is consumed by llama.py:940-949 which asserts
+   `q_len == 1` (decode-only). The batched teacher-forced blend DOES exist at llama.py:663-669
+   but requires the caller to PASS `inputs_embeds=<projected latents>` + `thinking_mask`.
+   => Stage 0 can reuse the BLEND but the PROJECTION must be factored out of `_sample`.
+   Human accepted, with the constraint that extraction be behaviour-preserving (bit-identical
+   generation) and the 2-pass cost confined to the Stage-0 script.
+4. **Data:** hrpo_gsm8k.py:16-18 `load_dataset('openai/gsm8k','main')[split]`; SYSTEM_PROMPT
+   utils.py:6-11; `extract_hash_answer` utils.py:25-27. GSM8K `answer` = reasoning + `#### ans`,
+   so the reference reasoning IS available for a teacher-forced target.
+5. **Λ logging:** GateGradientLogger (variant_common.py:358) is a TrainerCallback logging
+   GRADIENT NORMS only — it does NOT log Λ mean, per-dim CV or hidden ratio. Brief's assumption
+   corrected; Stage 0 needs a small extra logger (maths exists in analyse_gate.lambda_to_ratio).
+6. **Eval hook:** eval_gsm8k.py:36-55 switches on `gate_mode`; `"disabled"` → `disable_gate()`,
+   which sets `model.answer_start = ""` so `is_thinking` is False for every token (blend skipped
+   in both rollout and loss forward), weights untouched. Exactly the "latent off" semantics.
+
+## [Stage 0 brief — Phase 2] eval_all.py --latent_off
+
+Added `--latent_off` (+ `--variants` substring filter and `--rp` filter) to eval_all.py.
+  - Writes to **eval_results_latent_off.json**, never eval_results.json; `eval_is_complete` is
+    path-keyed so the two are never interchangeable. Comparison table (reads eval_results.json)
+    is untouched and is skipped entirely in latent-off mode.
+  - Forces `gate_mode="disabled"` (the disable_gate mechanism — no weight edits).
+  - Base models skipped in this mode (no latent channel; already evaluated gate-disabled).
+  - New `write_latent_off_summary()` pairs each run's normal vs latent-off eval → prints a table
+    and writes results/latent_off_summary.json, including an `identical_correctness_vector`
+    check (must be True for v1, whose gate is already disabled — the mode's sanity check).
+  - `--rp 1.0` filter added because a bare `--variants v3_learned_lambda` also matches the
+    rp=1.2 dirs; verified it selects the 10 rp=1.0 runs and excludes the 7 rp=1.2 ones.
+Default behaviour (no --latent_off) is byte-identical to before: filename, gate_mode, base loop
+and log strings all unchanged. Verified schema against a real eval_results.json
+(metrics.accuracy, results[].correct, metrics.gate_mode). Evals require GPU → run on cluster.
+
+## [Stage 0 brief — Phase 2 RESULT] latent-off evaluation
+
+Ran cluster/run_latent_off_eval.slurm (new; needed because the login node lacks HF_HOME +
+squid proxy — a bare run fails at model load with "Connection reset by peer"). 10 paired runs.
+
+SANITY (verification #1): all 3 v1 seeds Δ=+0.00 with identical_correctness_vector=True
+(bit-identical correctness vectors) — the mode provably changes nothing when the gate is
+already disabled.
+
+RESULT (normal -> latent-off, 1.5B rp=1.0, n=1319):
+  v3 learned Λ : 71.65->71.80 (+0.15), 68.69->69.67 (+0.99), 71.11->71.72 (+0.61)
+                 mean 70.48 -> 71.06  (Δ +0.58, all three seeds POSITIVE)
+  v4 full gate : 67.40->69.22 (+1.82), 70.81->69.52 (-1.29), 71.95->71.80 (-0.15)
+                 mean 70.05 -> 70.18  (Δ +0.13, signs mixed)   [full-LoRA seeds only]
+  v4 attn-LoRA : 67.70->66.94 (-0.76)  [single seed, different LoRA config — NOT pooled]
+
+INTERPRETATION: switching the latent channel off at inference costs nothing (v3 slightly up,
+v4 flat; both within seed noise). The trained models carry NO functional dependence on the
+latent pathway — a CAUSAL/interventional result, strictly stronger than the prior correlational
+collapse evidence (constant gate activation, Λ CV ≈ init, tied accuracies). This retires the
+"Mechanism is observational" threat-to-validity in RESULTS_SECTION §6.9.
+
+NUANCE: identical_correctness_vector=False for every v3/v4 run — individual answers flip in
+both directions, so the latent is INFORMATIONALLY inert, not numerically inert. Flip counts not
+yet quantified (would need the per-checkpoint eval_results_latent_off.json, which the results/
+sync does not pull).
+
+NOTE: write_latent_off_summary's per-arm grouping pooled -loraattention into the v4 mean (n=4);
+the correct full-LoRA v4 mean is 70.05 -> 70.18. Grouping is cosmetic (raw rows are correct).
+
+## [Stage 0 brief — Phase 3] C1 constant-vector control (v7_constant_vector)
+
+TWO DESIGN CORRECTIONS to the brief (both load-bearing):
+
+(a) The brief says to substitute at "the point where e_pred is formed" in
+    modeling_qwen2.py. The Eq.3 projection is NOT there — it is in
+    transformers/generation/utils.py:3369-3372. More importantly, substituting in the
+    GENERATION loop would leave u with ZERO gradient forever: generate() runs under
+    no_grad, and the recorded thinking_embeds are detached constants by the time the
+    loss forward runs, so brief check 3 would fail by construction. Instead the
+    substitution is made in `thinking_residual` itself, which covers BOTH call sites
+    (generation llama.py:944 and the live-graph log-prob forward llama.py:666) and puts
+    u in the loss graph. An initial edit to generation/utils.py was made and then fully
+    REVERTED — that file is byte-identical to HEAD (verified with git diff --quiet).
+
+(b) u is registered CONDITIONALLY (variant_common.register_constant_latent_vector),
+    not in ThinkingResidualLambda.__init__. Adding it to __init__ would change the
+    state dict of every model and risk breaking load_adapter on all existing settled
+    checkpoints. v1-v6 state dicts stay byte-identical. It is registered BEFORE
+    get_peft_model, because modules_to_save deep-copies the Lambda module there and u
+    must be inside that copy to reach the adapter.
+
+DESIGN DECISION: the constant path deliberately SKIPS the /||probs|| normalisation.
+Substituting before the divide would rescale u by a per-token varying scalar, so it
+would not be a constant at all.
+
+FREE PROPERTIES from placing u on thinking_residual_Lambda: its parameter name contains
+"thinking_residual_Lambda", so patch.py puts it in Lambda's 1e-3 optimizer group; and
+that module is already in GATE_MODULES/modules_to_save, so u is saved with the adapter.
+
+Changes: variant_common — `--latent_source {projection,constant}` (default projection, so
+every existing variant is unchanged), _constant_latent_thinking_residual,
+register_constant_latent_vector, apply_constant_latent_patch (raises if u not registered),
+v7_constant_vector appended AFTER v6 in VARIANT_CHAIN (indices unshifted),
+GATE_MODES["v7_constant_vector"]="unit", latent_source added to _CONFIG_FINGERPRINT so a
+resume cannot silently mix sources. plot_style — v7 label + colour. New
+hrpo_constant_vector.py (v3 copy; --latent_source projection takes v3's exact code path).
+parse_experiment_name verified to parse 1.5b-v7_constant_vector[-seedN][-rp1].
+
+NOTE: the brief's checklist assumes an "existing CPU test suite" — there is none (no
+tests/, no test files, no pytest config; pytest is in requirements). Created tests/ with
+tests/test_constant_vector.py.
+
+CHECKS: not yet run — torch is unavailable on the local box, so the pytest file must run
+on the cluster. The algebra behind check 2 was confirmed independently in pure python
+(substituting u for the residual is exact when u == residual).
+
+## [Stage 0 brief — Phase 3b] u-init scale diagnostic + rescale options
+
+Added --constant_init {mean,mean_scaled,random_row} (default "mean" = the brief's spec)
+and constant_init_stats(). register_constant_latent_vector now PRINTS ||u||, mean||e_i||
+and the ratio, and warns when u starts >10x smaller than a typical embedding row.
+Rationale: for a peaked probs the real Eq.3 output is close to a single embedding ROW,
+but the embedding CENTROID has a far smaller norm (rows cancel) — so the brief's "mean"
+init is on-manifold in direction but likely NOT scale-matched, and u would have to climb
+from near-zero at lr 1e-3. "mean_scaled" keeps the centroid direction at row scale;
+"random_row" is on-manifold in both senses. constant_init added to _CONFIG_FINGERPRINT.
+Tests extended to cover the scale gap and the mean_scaled rescale.
+
+KNOWN SHARP EDGE: experiment_dir has no suffix for latent_source, so running
+hrpo_constant_vector.py with --latent_source projection (the check-1 v3 reproduction)
+targets the SAME dir as constant mode. The _CONFIG_FINGERPRINT guard refuses a resume
+across that change, so nothing mixes silently, but check-1 runs should use a scratch dir.
+Not changed because the suffix regex only matches -(seed|rp|lora) and extending it would
+touch discovery for every existing run.
+
+## [Stage 0 brief — Phase 3 CHECKS PASSED + u-init decision]
+
+pytest tests/test_constant_vector.py: 8/8 PASSED on the cluster. Covers brief check 2
+(constant path bit-identical to the unit-gate path when u == residual), check 3 (u receives
+a non-zero gradient — the check the brief's generation-site design would have FAILED), the
+structural half of check 1 (projection branch installs v3's exact patch), Lambda's gradient
+path surviving the swap, the registration-ordering guard, and the two init-scale tests.
+
+u-INIT DECISION: keep --constant_init mean (the brief's spec, already the default).
+Measured on Qwen2.5-1.5B (151936 x 1536): centroid norm 0.3270 vs mean row norm 1.0126,
+ratio 0.3229 — u starts only 3.1x smaller than what it replaces. My earlier synthetic
+estimate of ~63x was unrepresentative: it used i.i.d. zero-centred Gaussians, where the
+centroid cancels to ~1/sqrt(V), whereas real LLM embedding tables carry a large shared
+common-direction component. 3.1x is the same order of magnitude, u is 1536 params at lr
+1e-3, and the blend already scales the latent by the hidden ratio (~0.167). mean_scaled and
+random_row remain available if C1 diagnostics show u stalling.
+
+BUGFIX (found while checking the above): GateGradientLogger matched
+"thinking_residual_Lambda" in name, which ALSO matches the C1 vector
+...thinking_residual_Lambda.u — so v7 would have logged Lambda+u pooled into one bucket and
+contaminated the gradient-flow diagnostic. u now has its own bucket, matched first
+(endswith ".u"). Empty/null for v1-v6, which have no u, so existing runs are unaffected.
+
+## [Stage 0 brief — Phase 4] stage0_warmstart.py + projection extraction + --init_from
+
+PROJECTION EXTRACTED (the Phase-1 item-3 blocker): Eq.3 is now
+transformers.generation.utils.hrpo_project_latent(probs, embed_weight), called by the
+_sample loop instead of being inlined there. Operation order preserved exactly (einsum,
+then in-place divide by the L2 norm cast to the result dtype), and the reshape is a no-op
+for the 2-D generation case, so rollouts are bit-identical. This is the ONLY change to
+vendored generation code; tests/test_projection_extraction.py pins it against a verbatim
+copy of the original inline expression (fp32/fp64, peaked and uniform p, and the
+sequence-shaped path vs a per-position loop).
+
+stage0_warmstart.py: one teacher-forced epoch over GSM8K-train.
+  - Prompt identical to RL (utils.SYSTEM_PROMPT + question); target = reference reasoning
+    (calculator <<...>> annotations stripped, since RL never rewards emitting them) plus
+    "#### <ans>"; loss masked to the assistant span.
+  - Think span mirrors the RL rule (is_thinking while the decoded string does not yet
+    contain "####"), evaluated on the teacher-forced target. Position 0 is always False —
+    its latent would come from position -1.
+  - --blend on: TWO passes. Pass 1 (no_grad) -> logits -> softmax(/temperature) -> Eq.3 via
+    the shared helper -> latents, shifted by one. Pass 2 passes input_ids + inputs_embeds +
+    thinking_mask together, which is what routes through unsloth's blend
+    (llama.py:606-607, 663-669) exactly as rl_replacements.py:410 does. Latents are
+    DETACHED deliberately: in RL they come from no_grad generation and are already
+    constants in the loss forward, so this is faithful, not a shortcut.
+  - Projection chunked over positions (--proj_chunk): probs is (B,S,152k), whole-sequence
+    materialisation would cost GBs.
+  - --blend off is a genuinely PLAIN LoRA SFT: modules_to_save=None, no Lambda reset, no
+    unit-gate patch, answer_start="". Two reasons: it makes check 1 ("bit-for-bit plain
+    PEFT SFT") literally true, and it is required for arm C3 — v1 has modules_to_save=None
+    so it cannot load an adapter carrying Lambda.
+  - Output experiments/{size}-stage0-{on|off}-rmin{r}-seed{N}/ + stage0_log.jsonl (loss,
+    Lambda mean, per-dim hidden-ratio CV, mean hidden ratio, Lambda grad norm, every 25
+    steps). The dir name deliberately does NOT match EXPERIMENT_NAME_RE, so eval_all and
+    analyse_replicates cannot mistake a warm start for an ablation result.
+  - Smoke knobs --limit/--max_steps/--freeze_lambda for cheap verification.
+
+--init_from: added to build_arg_parser and _CONFIG_FINGERPRINT, with
+variant_common.load_stage0_init() doing the load. It RAISES on unexpected keys rather than
+warning — a silent mismatch would leave a run cold-started while its logs claimed
+otherwise — reports missing keys and max |dLambda|, and warns if Lambda did not move.
+Wired into hrpo_grpo_baseline.py (C3) and hrpo_learned_lambda.py (T1), in both cases AFTER
+get_peft_model (the loader writes into the PEFT adapter).
+
+r_min: Stage 0 uses the shared --residual_r_min default of 0.98 per the human's Phase-1
+decision (match the existing -rp1 arms), NOT the brief's 0.95.
+
+CHECKS 1-4 NOT YET RUN: all four need a GPU.
+
+## [Stage 0 brief — Phase 4] cluster/run_stage0.slurm
+
+Batch wrapper for stage0_warmstart.py. Env block byte-identical to the working
+run_eval_and_analysis.slurm (HF_HOME + squid proxy) — a bare login-node run fails at model
+load, as both earlier attempts did.
+
+Adds a PREFLIGHT enforcing the brief's ground rule 0: asserts transformers/unsloth/trl all
+resolve INSIDE the repo (a pip install would silently shadow the vendored forks with stock,
+gate-less packages and every run would train with no latent path), and that the extracted
+hrpo_project_latent helper is importable. Fails in seconds rather than after burning GPU.
+
+Knobs via env: MODEL_SIZE, BLEND{on,off}, SEED, R_MIN (default 0.98, matching the -rp1 arms),
+BATCH_SIZE, GRAD_ACCUM, PROJ_CHUNK, LIMIT, MAX_STEPS, FREEZE_LAMBDA, plus SMOKE=1 which sets
+LIMIT=64 MAX_STEPS=10 for a cheap machinery check.
+
+BATCH_SIZE defaults to 4 (not RL's 8) with GRAD_ACCUM 8, keeping the effective batch at 32:
+Stage-0 pass 1 materialises a (batch, seq, 152k) logits tensor that RL's rollout path never
+holds, so the memory profile is different. If it still OOMs, lower BATCH_SIZE then PROJ_CHUNK.
+
+## [Stage 0 brief — Phase 4] test fix: batched-vs-loop projection is FP-equal, not bit-equal
+
+pytest run on the cluster: 12/13 passed. The one failure,
+test_sequence_shape_equals_per_position_loop, was a BAD ASSERTION on my part, not a code
+defect: it demanded torch.equal between one (B*S,V)@(V,D) GEMM and B separate (S,V)@(V,D)
+GEMMs. BLAS does not promise the same accumulation order across different shapes, so the
+last ULPs differ — observed deviations ~1e-6/1e-7 in fp32 over a 512-term reduction
+(e.g. -1.6080e-04 vs -1.6096e-04, 9.1472e-02 vs 9.1473e-02).
+
+Relaxed to allclose(rtol=1e-5, atol=1e-5) PLUS an explicit max-deviation bound of 1e-4, so a
+genuine defect (wrong reshape, transposed einsum, mis-broadcast norm — all of which move
+values by O(0.1-1)) still fails by 5+ orders of magnitude.
+
+IMPORTANTLY the bitwise guarantee that protects existing arms was never in question and
+PASSED: test_matches_original_bitwise (fp32 and fp64) plus the peaked/uniform test cover the
+2-D generation shape, where the reshape is a no-op. Rollouts remain bit-identical.
+
+## [Stage 0 brief — Phase 4] smoke results: blend=off OK, blend=on hit a dtype bug (fixed)
+
+Jobs 16047 (off), 16048 (on+freeze_lambda), 16049 (on). A100-80GB.
+
+PREFLIGHT WORKED: "preflight OK: vendored transformers/unsloth/trl + Eq.3 helper present" —
+the ground-rule-0 guard against pip-shadowed forks fires correctly.
+
+16047 --blend off: COMPLETED. 10 steps, train_loss 4.27, wrote checkpoint-10 +
+stage0_summary.json. final_lambda=None and no stage0_log.jsonl, both correct: the Lambda
+diagnostics are guarded to blend_on. Confirms the plain-SFT path runs with no gate code path.
+(Note: "epoch 5.0" is a smoke artifact — 64 examples at an effective batch of 32 is 2 steps
+per epoch, so --max_steps 10 loops the subset 5x. Expected, not a defect.)
+
+16048 + 16049 --blend on: BOTH FAILED, identical error, my bug:
+    stage0_warmstart.py:209 _project -> hrpo_project_latent -> einsum
+    RuntimeError: expected scalar type BFloat16 but found Float
+_project upcast logits with .float() for a numerically stable softmax (good) but then fed
+fp32 probs into the einsum against the bf16 embedding table. FIXED by casting probs back to
+embed_weight.dtype before the einsum — at the CALLER, deliberately not inside
+hrpo_project_latent: a silent internal cast would both mask caller bugs and change the dtype
+behaviour of the rollout path the helper is a faithful extraction of. Casting back also keeps
+the einsum in the same dtype generation uses, so Stage 0 stays faithful to the RL path.
+Regression test added (test_mixed_dtype_probs_and_embedding_must_be_cast_by_the_caller).
+
+Pass-1 MEMORY IS STILL UNTESTED: both blended runs died before the projection completed, so
+the (batch, seq, 152k) logits cost has not actually been measured. The node is an 80GB A100,
+so BATCH_SIZE=4 is likely conservative.
+
+Also fixed: run_stage0.slurm printed a stage0_log.jsonl path for blend=off runs, which never
+produce that file.
+
+## [Stage 0 brief — Phase 4] smoke round 2: dtype fixed, but CHECK 2b FAILED
+
+Jobs 16083 (on+freeze_lambda) and 16084 (on) both COMPLETED — the bf16/fp32 einsum fix works,
+and pass 1's (batch, seq, 152k) projection ran without OOM on the 80GB A100 at BATCH_SIZE=4.
+
+BUT Lambda DID NOT MOVE in either run:
+  initial == final == lambda_mean 6.833611488342285, hidden_ratio 0.13819901645183563,
+  hidden_ratio_cv 0.30054810643196106  (bit-identical), and lambda_grad_norm = null.
+Check 2a (frozen Lambda unchanged) therefore "passes" only VACUOUSLY — Lambda does not move
+even when trainable, so the test cannot distinguish frozen from not. Check 2b FAILS: no
+gradient ever reached Lambda, i.e. the blend is contributing nothing to the loss.
+
+Ruled out: **kwargs IS forwarded through CausalLM_fast_forward to the inner model
+(llama.py, "outputs = self.model(..., *args, **kwargs)"), so thinking_mask does propagate.
+
+Instrumented rather than guessed — three diagnostics added for the next smoke run:
+  1. think-span statistics printed after dataset build (mean/min/max think tokens per example
+     and how many examples have an EMPTY span), raising if every span is empty. An empty mask
+     is the leading hypothesis: the blend then never fires and Lambda gets no gradient.
+  2. an assertion that Lambda is trainable and present in an optimizer param group
+     (skipped under --freeze_lambda, where requires_grad=False is the intent).
+  3. Stage0Logger now fires on the first few steps as well — with every=25 and a 10-step smoke
+     run it only ever logged step 0, which is why the logs were nearly empty.
+
+Also noted: both blend=on runs write to the SAME output dir (freeze_lambda is not part of the
+name), so the second overwrote the first and stage0_log.jsonl holds appended records from
+both. Same class of sharp edge as latent_source not being in experiment_dir.
+
+## [Stage 0 brief — Phase 4] smoke round 3: mask and optimizer RULED OUT, blend counter added
+
+Job 16092 (--blend on, with the new diagnostics):
+  think-span over 64 examples: mean 88.2 tokens, min 24, max 276; mean seq len 231.5;
+  examples with EMPTY think span: 0/64          <- mask hypothesis DISPROVED
+  trainable Lambda params: ['...thinking_residual_Lambda.modules_to_save.default.Lambda']
+  Lambda tensors in optimizer: 1                <- optimizer hypothesis DISPROVED
+  initial == final lambda_mean 6.833611488342285 (bit-identical), grad norm still null.
+
+So Lambda gets no gradient even though the think mask is substantial (88 of ~231 tokens) and
+Lambda is both trainable and in an optimizer param group. The remaining explanation is that
+the forward never reaches the blend at all.
+
+Added a decisive, callback-independent instrument: thinking_residual is wrapped with a
+counter (BLEND_CALLS) after the unit-gate patch, and the run prints how many times the blend
+executed and how many masked rows were blended, with an explicit ERROR line if the count is 0.
+
+Separately noted (secondary): Stage0Logger is registered (verified in source) and
+on_pre_optimizer_step DOES exist in transformers 4.50.3 (trainer_callback.py:387), yet run
+16092 appended nothing to stage0_log.jsonl (file mtime is still from the previous jobs).
+Suspect unsloth's patched _fast_inner_training_loop does not dispatch that hook. Not chased
+further because the initial/final lambda_diagnostics do not depend on the callback and
+already establish the finding.
+
+## [Stage 0 brief — Phase 4] smoke round 4: blend EXECUTES; problem is gradient flow, not routing
+
+Job 16108: "[stage0] blend executions: 80 calls, 28230 masked rows blended"
+80 = 10 optimizer steps x 8 grad-accum micro-batches, i.e. thinking_residual fires on every
+forward, and ~28k positions are actually blended. So the forward DOES reach
+llama.py:663-669 and thinking_mask propagates correctly.
+
+Yet Lambda is still bit-identical (6.833611488342285) with a null grad norm. Combined with
+the earlier results this rules out, with evidence, all three of: empty think mask (0/64
+empty, mean 88.2 tokens), Lambda not trainable / not in optimizer (1 tensor, correct name),
+and the blend not executing (80 calls).
+
+=> The remaining failure mode is GRADIENT FLOW: Lambda is not connected to the loss graph,
+or the connection is severed between thinking_residual's output and the loss. Added a
+one-shot autograd probe in compute_loss that calls torch.autograd.grad(loss, Lambda,
+allow_unused=True) on the first step and reports loss.requires_grad,
+Lambda.requires_grad and whether the gradient is None — answering the question directly
+instead of by elimination.
+
+Leading suspect to check next: use_gradient_checkpointing="unsloth". The blend happens at the
+embedding level, upstream of the checkpointed decoder layers; if unsloth's offloaded
+checkpointing detaches at that boundary, parameters used BEFORE the first checkpointed
+segment would receive no gradient while the LoRA parameters inside the segments train
+normally — which matches the observed pattern exactly (loss decreases, Lambda frozen).
+
+## [Stage 0 brief — Phase 4] smoke round 5: Lambda is NOT in the loss graph (confirmed)
+
+Job 16368 probe:
+  [stage0][probe] loss.requires_grad=True Lambda.requires_grad=True grad_is_None=True
+torch.autograd.grad(loss, Lambda, allow_unused=True) returns None. So with the blend
+confirmed executing (80 calls, 28230 rows), the think mask dense, and Lambda both trainable
+and in the optimizer, the defect is definitively a BROKEN GRADIENT CONNECTION between the
+blend output and the optimised Lambda — not routing, masking or optimiser configuration.
+
+Leading suspect now: _unit_gate_thinking_residual computes a_t = self.thinking_residual_Lambda(ones),
+and after get_peft_model that attribute is a PEFT ModulesToSaveWrapper. Its forward falls back
+to original_module (the FROZEN copy) when adapters are disabled or the active adapter is not in
+modules_to_save. If that fallback is taken, a_t is built from the frozen Lambda: the blend runs,
+the loss is fine, and the gradient goes to a parameter nobody optimises — exactly the observed
+signature. (Note v3 RL does get Lambda gradients, so whatever differs is specific to the Stage-0
+HF Trainer setup rather than to the patch itself.)
+
+Added a one-shot in-blend probe reporting embeds/residual/a_t/out requires_grad plus the Lambda
+module type, its original_module, which parameters inside it are trainable, and
+disable_adapters/active_adapter/modules_to_save keys.
+
+## [Stage 0 brief — Phase 4] smoke round 6: wrapper suspect DISPROVED; checkpointing now prime
+
+Job 16369 in-blend probe:
+  embeds.rg=True residual.rg=False a_t.rg=True out.rg=True
+  Lambda module=ModulesToSaveWrapper (orig=ThinkingResidualLambda)
+      trainable_inside=['modules_to_save.default.Lambda']
+  disable_adapters=False active=default keys=['default']
+So PEFT dispatches to the TRAINABLE Lambda, a_t and the blend output both require grad — the
+ModulesToSaveWrapper/original_module hypothesis is DISPROVED. The connection is intact AT the
+blend; the break is downstream, between the blended embeddings and the loss.
+
+Decisive clue: embeds.rg=True even though embed_tokens is frozen. inputs_embeds only requires
+grad because something explicitly marked it — the standard enable_input_require_grads trick
+that exists precisely to make GRADIENT CHECKPOINTING work with frozen embeddings. Combined
+with loss.requires_grad=True (LoRA inside the segments trains, loss falls) while Lambda
+upstream of the first segment gets nothing, this is the classic signature of a checkpoint
+boundary that does not propagate gradient to its input.
+
+Ruled out on inspection: the .detach() at llama.py:713 is inside a DPO-only branch
+(_has_no_labels), not our path.
+
+Two changes to test diagnosis and fix in one run:
+  1. --grad_checkpoint {off,unsloth,True}, DEFAULT OFF for Stage 0 (memory is not the
+     constraint — 80GB at batch 4 — correctness is). Exposed via GRAD_CKPT in run_stage0.slurm.
+  2. a bisection probe: the blend output is captured and grad(loss, blend_output) reported.
+     None => the break is downstream of the blend; not-None => between blend output and Lambda.
+
+## [Stage 0 brief — Phase 4] ROOT CAUSE FOUND: unsloth detaches inputs_embeds (llama.py:707)
+
+Job 16370 supplied the missing bisection: "grad(loss, blend_output) is None: True" — the break
+is DOWNSTREAM of the blend — and turning gradient checkpointing off did NOT help, killing that
+hypothesis too.
+
+CAUSE (unsloth/models/llama.py:707, a DPO-oriented branch):
+    if getattr(self, "_has_no_labels", False) is True and (attention_mask is not None) \
+       and (past_key_values is None) and (not train_embed_tokens):
+        if not inputs_embeds.is_leaf:
+            inputs_embeds = inputs_embeds.detach()          # severs the graph
+        ...
+        if inputs_requires_grad: inputs_embeds.requires_grad_(True)   # fresh leaf
+with llama.py:1067  self.model._has_no_labels = labels is None.
+
+The Stage-0 call met ALL FOUR conditions: labels not passed (we compute CE ourselves),
+attention_mask passed, no past_key_values, embed_tokens frozen. So immediately AFTER the Eq.4
+blend the embeddings were detached and re-marked as a fresh leaf. That is why every
+observation held simultaneously and looked contradictory: the blend executed (80 calls), a_t
+and the blend output required grad, Lambda was trainable and in the optimizer, loss.requires_grad
+was True and the loss fell (LoRA lives INSIDE the layers, downstream of the new leaf) — while
+Lambda, upstream of it, received nothing.
+
+Why v3 RL was unaffected: rl_replacements.py:409 calls the model as
+    trainer.model(input_ids=..., inputs_embeds=..., thinking_mask=..., logits_to_keep=...)
+with NO attention_mask, so condition 2 fails and the detach never fires. The bug was specific
+to how I called the model, not to the blend, the mask, the optimizer or checkpointing — all of
+which the earlier rounds had (correctly) eliminated.
+
+FIX: stop passing attention_mask to the model in stage0_warmstart.compute_loss (both passes),
+matching the RL log-prob call exactly. Safe: unsloth nulls attention_mask during training
+anyway (llama.py:726-728), padding is already excluded from the loss via labels=-100 and from
+the think mask, so no attention behaviour changes.
+
+HARDENED: the one-shot probe now RAISES instead of printing if grad(loss, Lambda) is None, so a
+decorative blend can never again pass silently as a warm start.
+
+## [Stage 0 brief — Phase 4] fix CONFIRMED by the failure mode; probe replaced with a hook
+
+Job 16371 (first run with attention_mask removed) crashed — but on the PROBE, not on training:
+    RuntimeError: When use_reentrant=True, torch.utils.checkpoint is incompatible
+    with .grad() or passing an `inputs` parameter to .backward()
+
+That error is itself the confirmation the fix worked. In job 16370 (attention_mask still
+passed) torch.autograd.grad(loss, Lambda, allow_unused=True) returned None IMMEDIATELY, because
+Lambda was disconnected and no traversal was required. With attention_mask removed the graph now
+extends back THROUGH the checkpointed decoder layers to the blend and Lambda, so autograd.grad
+must traverse a reentrant checkpoint — which PyTorch forbids. The probe could only hit this
+error once Lambda became reachable.
+
+Replaced the probe with a BACKWARD HOOK on the trainable Lambda (LAMBDA_GRAD), which counts
+gradient arrivals and the max |grad| during the ordinary backward. This is checkpointing-safe
+(no .grad() call) and is a stronger check anyway: it proves gradient actually FLOWS to Lambda
+in real training rather than that a graph path merely exists. The run now RAISES if zero
+gradients ever arrive, so a decorative blend can never pass silently as a warm start.
+
+Note gradient checkpointing was evidently still active despite --grad_checkpoint off; not
+chased, because the hook is correct either way and checkpointing is desirable for the full run.
+
+## [Stage 0 brief — Phase 4] warm starts TRAINED; checks 3 & 4 tooling
+
+Real one-epoch warm starts completed (233 steps each, seed 42, r_min 0.98):
+  blend=on  (job 16373): 1864 Lambda grad arrivals (= 233 steps x 8 accum), max |grad|
+            1.689e-02; 1864 blend executions, 641,075 masked rows. Lambda 6.833611 ->
+            6.764175; hidden_ratio 0.138199 -> 0.142826 (+3.3%); cv 0.30055 -> 0.29712.
+            train_loss 3.785. The latent fraction RISES — a genuine warm start. For scale,
+            v3 RL converges at hidden_ratio 0.1671, so Stage 0 covers ~10% of that gap
+            before RL starts.
+  blend=off (job 16374): train_loss 3.777, final_lambda None (correct — no Lambda at all).
+
+Checks 1, 2a, 2b are now satisfied. Tooling added for the remaining two:
+  * --init_only (build_arg_parser) makes check 3 cost seconds: the RL script loads the warm
+    start, reports, and exits before training. load_stage0_init now also prints the resulting
+    lambda_mean so it can be compared directly against stage0_summary.json's final value
+    (blend=on: 6.7641754150390625).
+  * eval_stage0.py for check 4. Stage-0 dirs are deliberately invisible to eval_all, and
+    eval_gsm8k.py's __main__ infers base model/temperature from the path (a `-temp` suffix)
+    which they lack, so they need their own entry point. Gate mode mirrors training
+    (on -> "unit", off -> "disabled"); results go to eval_results_stage0.json, never
+    eval_results.json, so nothing can leak into the ablation comparison table.
+  * cluster/run_stage0_checks.slurm runs 3a, 3b and 4 in one job.
+
+## [Stage 0 brief — Phase 4] checks 3 & 4; WARM-START ARM COLLISION found and fixed
+
+CHECK 4 (job 16475): zero-shot GSM8K of the warm starts vs base 61.11 —
+  stage0 --blend on  59.06% (-2.05)     stage0 --blend off 58.98% (-2.13)
+Both slightly BELOW base, and only 0.08 apart. Expected and flagged in advance: one SFT epoch
+optimises next-token likelihood, not answer correctness, and at hidden_ratio ~0.14 the blend
+contributes little. The warm start's value is whether it improves the RL STARTING POINT, which
+only T1 vs A1 in Phase 5 can answer — this number neither confirms nor refutes it.
+
+CHECK 3 DID NOT RUN, and why is important: both invocations printed
+  "Experiment ./experiments/1.5b-v3_learned_lambda-rp1 already has a completed checkpoint"
+exit_if_complete() fires at the top of main(), long before --init_from. The cause is that
+experiment_dir() did not include init_from in the suffix, so a WARM-STARTED run resolved to the
+SAME directory as its cold counterpart — i.e. arm T1 mapped onto the settled A1 result. It
+exited harmlessly only because that directory is complete; on an incomplete one it would have
+trained into a directory holding a dissertation number.
+
+A second, quieter hazard from the same root: analyse_replicates.parse_suffix extracted only
+seed/rp/lora, so T1 and A1 would have produced the SAME arm key and been pooled as two seeds of
+one arm — silently averaging a treatment with its own control.
+
+FIX (three coordinated changes):
+  * experiment_dir appends -warm{on|off} when --init_from is set (appended last, so no existing
+    directory name changes);
+  * EXPERIMENT_NAME_RE accepts warm in the suffix alternation;
+  * analyse_replicates.parse_suffix returns a 4th element and the arm key becomes
+    (size, variant, rp, lora, warm); arm_label reports "· warm-start {tag}".
+Consumers updated for the new arity: generate_report._seed_arms and _primary_arms (which now
+also EXCLUDES warm arms from the cold ablation cells), and all comparison keys in
+analyse_replicates. Added the comparisons the brief actually wants: T1 vs A1 and C3 vs v1.
+Verified end to end: A1 and T1 get distinct dirs AND distinct arm keys, while T1 seeds 42/43
+still group together; every pre-existing arm still parses with warm=None, so nothing already on
+disk changes meaning.
+
+---
+## D2 programme (2026-10-02): rollout parameter noise + exploration controls
+
+Goal: test whether restoring exploration (QeRL-style RMSNorm weight noise, and plain rollout
+temperature / learning-rate controls) improves GSM8K accuracy of GRPO (v1) and HRPO (v3) under
+Dr. GRPO, before building anything latent-specific. Everything below is OFF by default; with the
+new flags unset every pre-existing code path and directory name is unchanged.
+
+Files added: noise_ext.py, eval_d2.py, analyse_d2.py, cluster/submit_d2.sh, cluster/run_eval_d2.slurm,
+tests/test_noise_ext.py, tests/test_new_arm_naming.py.
+Files changed: variant_common.py only.
+
+variant_common.py
+  * --noise_sigma_start/--noise_sigma_end/--noise_stages/--noise_mode (default: off). apply_exploration_noise()
+    is called from train_with_resume next to apply_dr_grpo, so every variant script gets it.
+  * experiment_dir: a run that moves the rollout temperature (!= 0.5), the learning rate (!= 5e-6) or turns
+    noise on is named "new-<size>-<variant>-...-t0.8 / -lr1e-05 / -noise0.05to0.005". The "new-" prefix keeps
+    EXPERIMENT_NAME_RE from matching, so eval_all / analyse_replicates / generate_report never see these
+    directories. Reason: parse_suffix ignores unknown tokens, which would pool a noisy run with its own
+    Dr. GRPO control as extra seeds of one arm (the same hazard as the warm-start fix above). eval_d2.py and
+    analyse_d2.py own the "new-" directories. Before this change a temperature/lr probe would have resolved
+    to the SAME directory as its baseline (temperature and lr were fingerprinted but not in the name).
+  * Noise keys added to _CONFIG_FINGERPRINT with resume-safe defaults in _FINGERPRINT_DEFAULTS.
+  * --repetition_penalty default 1.2 -> 1.0. 1.0 is the only value used for any reported result; the old
+    default let a forgotten flag train an off-paper run. experiment_dir still suffixes "-rp1" for 1.0, so
+    every settled directory name is unchanged.
+
+KNOWN PROTOCOL FACT (not new, but now stated): --seed reaches only get_peft_model(random_state=...), i.e. the
+LoRA/Lambda initialisation. The variant scripts build GRPOConfig without a seed, so data order and the trainer
+RNG are the HF default (42) for every seed (grpo_trainer.py:364 set_seed(args.seed=42)). Same-seed baseline and
+treatment share init and data order, which makes per-seed comparisons paired, but the seed SD is an
+initialisation SD, not a full training-seed SD. D2 runs follow the same convention so the settled Dr. GRPO
+baselines stay valid controls.
+
+Verified locally with torch/scipy stubbed: naming/isolation logic and the analyse_d2 pipeline on synthetic
+experiment directories. NOT verified: noise_ext.py (needs torch; tests/test_noise_ext.py must be run on the
+cluster) and everything that touches a GPU.

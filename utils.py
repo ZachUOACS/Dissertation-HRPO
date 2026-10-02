@@ -36,7 +36,51 @@ def extract_boxed_answer(text: str) -> str | None:
         return None
 
 
-def get_reward_func(process_answer_func):
+# Reward-shaping constants (ablation variants v5/v6). Both default to 0.0
+# (disabled) so the stock outcome-only reward below is numerically unchanged.
+FORMAT_REWARD = 0.0
+REASONING_BONUS = 0.0
+
+# Minimum characters of reasoning text before ANSWER_START for REASONING_BONUS.
+_MIN_REASONING_CHARS = 10
+
+
+def _is_repetition_loop(
+    text: str,
+    min_len: int = 8,
+    max_len: int = 120,
+    min_repeats: int = 4,
+    tail_chars: int = 600,
+) -> bool:
+    """Detect degenerate repetition loops near the end of a completion.
+
+    Flags the completion when its final `tail_chars` characters contain the
+    same substring (length `min_len`..`max_len`) repeated `min_repeats` or
+    more times back-to-back. Character-level so CJK loops (no whitespace)
+    are caught too.
+    """
+    if not text:
+        return False
+    tail = text[-tail_chars:]
+    pattern = r"(.{%d,%d})\1{%d,}" % (min_len, max_len, min_repeats - 1)
+    return re.search(pattern, tail, re.DOTALL) is not None
+
+
+def get_reward_func(
+    process_answer_func,
+    format_reward: float = None,
+    reasoning_bonus: float = None,
+    zero_repetition_loops: bool = False,
+):
+    """Outcome reward with optional shaping (v5) and repetition zeroing (v6).
+
+    Defaults (None/None/False) reproduce the original reward exactly:
+    1.0 iff the extracted answer is correct AND ANSWER_START occurs exactly
+    once, else 0.0.
+    """
+    fmt_reward = FORMAT_REWARD if format_reward is None else format_reward
+    rsn_bonus = REASONING_BONUS if reasoning_bonus is None else reasoning_bonus
+
     def reward_func(completions, answer, **kwargs) -> list[float]:
         responses = [completion[0]["content"] for completion in completions]
 
@@ -49,7 +93,18 @@ def get_reward_func(process_answer_func):
         pattern = f"^(?:(?!{escaped_answer_start}).)*{escaped_answer_start}(?:(?!{escaped_answer_start}).)*$"
         matches = [bool(re.search(pattern, r, re.DOTALL)) for r in responses]
 
-        rewards = [1.0 if a and m else 0.0 for a, m in zip(accuracy, matches)]
+        rewards = []
+        for response, a, m in zip(responses, accuracy, matches):
+            reward = 1.0 if a and m else 0.0
+            if m and fmt_reward:
+                reward += fmt_reward
+            if m and rsn_bonus:
+                reasoning_text = response.split(ANSWER_START)[0].strip()
+                if len(reasoning_text) >= _MIN_REASONING_CHARS:
+                    reward += rsn_bonus
+            if zero_repetition_loops and _is_repetition_loop(response):
+                reward = 0.0
+            rewards.append(reward)
 
         print(
             "=" * 50,
@@ -58,7 +113,7 @@ def get_reward_func(process_answer_func):
             "\n" + "=" * 50,
         )
         return rewards
-    
+
     return reward_func
 
 
@@ -349,6 +404,124 @@ def process_math(batch):
         "prompt": prompts,
         "answer": [extract_boxed_answer(a) for a in batch["solution"]]
     }
+
+
+# --- MATH loading -----------------------------------------------------------
+# The original release (Hendrycks et al.) ships as root/<split>/<category>/*.json
+# with 'problem' and 'solution' fields, which is what hrpo_math.py and
+# eval_math.py expect via their own preprocess_math(). The HuggingFace mirrors
+# expose the same two fields, so both paths converge on process_math() above and
+# yield an identical {prompt, answer} dataset. MATH-500 is the 500-problem
+# evaluation subset used as the reported test set and needs no local copy.
+# Imports are local to each function so utils' import surface is unchanged for
+# the training scripts that load it on every run.
+MATH_LOCAL_ROOTS = ("../MATH", "./MATH", "/data/ztay632/MATH")
+MATH_HF_TRAIN = "EleutherAI/hendrycks_math"     # one config per subject
+MATH_HF_TEST = "HuggingFaceH4/MATH-500"
+
+
+def _math_from_local(root, split):
+    """root/<split>/<category>/*.json -> Dataset(problem, solution)."""
+    import json
+    import os
+    from datasets import Dataset
+    problems, solutions = [], []
+    split_dir = os.path.join(root, split)
+    for folder in sorted(os.listdir(split_dir)):
+        sub = os.path.join(split_dir, folder)
+        if not os.path.isdir(sub):
+            continue
+        for file in sorted(os.listdir(sub)):
+            if file.endswith(".json"):
+                with open(os.path.join(sub, file)) as f:
+                    entry = json.load(f)
+                problems.append(entry["problem"])
+                solutions.append(entry["solution"])
+    if not problems:
+        raise FileNotFoundError(f"no MATH .json files under {split_dir}")
+    return Dataset.from_dict({"problem": problems, "solution": solutions})
+
+
+def _math_from_hub(split):
+    from datasets import concatenate_datasets, get_dataset_config_names, load_dataset
+    if split == "test":
+        return load_dataset(MATH_HF_TEST)["test"].select_columns(["problem", "solution"])
+    parts = [load_dataset(MATH_HF_TRAIN, c)[split].select_columns(["problem", "solution"])
+             for c in get_dataset_config_names(MATH_HF_TRAIN)]
+    return concatenate_datasets(parts)
+
+
+def load_math_raw(split="train", root=None):
+    """MATH as Dataset(problem, solution): a local copy if present, else the
+    HuggingFace mirror. Raises with both options spelled out rather than
+    silently training on the wrong thing."""
+    import os
+    roots = [root] if root else list(MATH_LOCAL_ROOTS)
+    for r in roots:
+        if r and os.path.isdir(os.path.join(r, split)):
+            print(f"[math] local copy: {os.path.join(r, split)}")
+            return _math_from_local(r, split)
+    try:
+        print(f"[math] no local copy in {roots}; loading from the hub")
+        return _math_from_hub(split)
+    except Exception as exc:                                   # noqa: BLE001
+        raise RuntimeError(
+            f"could not load MATH '{split}'. Either point --math_root at a "
+            f"directory holding {split}/<category>/*.json, or make "
+            f"{MATH_HF_TRAIN} / {MATH_HF_TEST} reachable (compute nodes need "
+            f"the squid proxy and HF_HOME exported). Cause: {exc!r}") from exc
+
+
+def preprocess_math_dataset(split="train", chunk_size=1000, root=None):
+    r"""MATH in the {prompt, answer} shape every variant script consumes.
+
+    Nothing is dropped, deliberately. Two MATH train solutions (indices 5341 and
+    5343) contain an empty '\boxed{}' — the answer was lost upstream — so their
+    gold answer is empty. They were in the training set of every completed MATH
+    run (tier10), and removing them would reshuffle the whole data order, so a
+    later run would differ from tier10 in more than the one thing it varies.
+    Stage 0 does drop them (math_sft_target): a warm start must never teach
+    '#### \boxed{}'."""
+    return load_math_raw(split, root).map(
+        process_math, batched=True, batch_size=chunk_size, load_from_cache_file=False)
+
+
+def has_boxed_answer(solution: str) -> bool:
+    r"""True when a MATH solution carries a real \boxed answer.
+
+    extract_boxed_answer cannot answer this: it splits on the substring "boxed"
+    and never returns None, so prose with no \boxed at all comes back as an
+    invented answer — "no boxed answer here" yields '\boxed{answer here}'.
+    On MATH train, 7,498 of 7,500 pass: the two failures contain an empty
+    '\boxed{}' (see preprocess_math_dataset). Two others use the brace-less
+    '\boxed 9', which extract_boxed_answer reads correctly and which pass."""
+    return ("\\boxed" in solution
+            and extract_boxed_answer(solution) not in (None, "\\boxed{}"))
+
+
+def math_sft_target(solution: str):
+    r"""Stage-0 (teacher-forced) target for a MATH solution: the reference
+    reasoning, then '#### \boxed{X}'.
+
+    The answer MUST stay boxed. process_math_answer understands only a boxed
+    answer or one in LaTeX delimiters; a bare '#### X' falls through to "take the
+    last number in the string", so '#### \frac{\pi}{2}' is read as '2'. Across
+    the 7,500 MATH training problems the bare form scores 1.0 under the RL reward
+    on only 5,080; the boxed form on all 7,500 (tests/test_math_stage0.py).
+
+    Returns None when the solution has no boxed answer, or already contains the
+    answer marker (the reward requires exactly one)."""
+    if not has_boxed_answer(solution) or ANSWER_START in solution:
+        return None
+    return f"{solution.strip()}\n{ANSWER_START} {extract_boxed_answer(solution)}"
+
+
+def load_math500():
+    """The 500-problem MATH evaluation subset, always from the hub. Evaluation
+    deliberately does NOT use a local MATH test split: that is the full ~5000
+    problem set, and mixing the two would change the reported denominator."""
+    from datasets import load_dataset
+    return load_dataset(MATH_HF_TEST)["test"].select_columns(["problem", "solution"])
 
 
 def process_mmlu(batch):

@@ -1,0 +1,112 @@
+{
+  "1.5b-v1_grpo_baseline": {
+    "model_size": "1.5b",
+    "variant_id": "v1_grpo_baseline",
+    "start_time": "2026-09-30T09:00:42+13:00",
+    "end_time": "2026-10-01T09:30:52+13:00",
+    "status": "completed",
+    "wall_clock_seconds": 88156.6,
+    "peak_gpu_memory_allocated_gb": 6.505,
+    "peak_gpu_memory_reserved_gb": 7.318,
+    "global_step": 937
+  },
+  "1.5b-v2_fixed_blend": {
+    "model_size": "1.5b",
+    "variant_id": "v2_fixed_blend",
+    "start_time": "2026-07-14T10:17:26+12:00",
+    "end_time": "2026-07-15T03:14:20+12:00",
+    "status": "completed",
+    "wall_clock_seconds": 60984.2,
+    "peak_gpu_memory_allocated_gb": 5.128,
+    "peak_gpu_memory_reserved_gb": 5.598,
+    "global_step": 934
+  },
+  "1.5b-v3_learned_lambda": {
+    "model_size": "1.5b",
+    "variant_id": "v3_learned_lambda",
+    "start_time": "2026-09-30T04:12:05+13:00",
+    "end_time": "2026-10-01T02:40:25+13:00",
+    "status": "completed",
+    "wall_clock_seconds": 80845.8,
+    "peak_gpu_memory_allocated_gb": 6.643,
+    "peak_gpu_memory_reserved_gb": 7.611,
+    "global_step": 937
+  },
+  "1.5b-v4_full_hrpo_gate": {
+    "model_size": "1.5b",
+    "variant_id": "v4_full_hrpo_gate",
+    "start_time": "2026-07-28T13:56:37+12:00",
+    "end_time": "2026-07-29T04:57:25+12:00",
+    "status": "completed",
+    "wall_clock_seconds": 54016.3,
+    "peak_gpu_memory_allocated_gb": 5.167,
+    "peak_gpu_memory_reserved_gb": 5.676,
+    "global_step": 934
+  },
+  "1.5b-v5_hrpo_format_reward": {
+    "model_size": "1.5b",
+    "variant_id": "v5_hrpo_format_reward",
+    "start_time": "2026-07-15T11:37:50+12:00",
+    "end_time": "2026-07-16T03:16:37+12:00",
+    "status": "completed",
+    "wall_clock_seconds": 56297.6,
+    "peak_gpu_memory_allocated_gb": 5.162,
+    "peak_gpu_memory_reserved_gb": 5.637,
+    "global_step": 934
+  },
+  "1.5b-v6_hrpo_full": {
+    "model_size": "1.5b",
+    "variant_id": "v6_hrpo_full",
+    "start_time": "2026-07-15T23:54:06+12:00",
+    "end_time": "2026-07-16T16:35:36+12:00",
+    "status": "completed",
+    "wall_clock_seconds": 60059.6,
+    "peak_gpu_memory_allocated_gb": 5.16,
+    "peak_gpu_memory_reserved_gb": 5.637,
+    "global_step": 934
+  },
+  "3b-v1_grpo_baseline": {
+    "model_size": "3b",
+    "variant_id": "v1_grpo_baseline",
+    "start_time": "2026-07-16T09:16:36+12:00",
+    "end_time": "2026-07-17T04:20:56+12:00",
+    "status": "completed",
+    "wall_clock_seconds": 68591.6,
+    "peak_gpu_memory_allocated_gb": 8.394,
+    "peak_gpu_memory_reserved_gb": 8.867,
+    "global_step": 934
+  },
+  "3b-v2_fixed_blend": {
+    "model_size": "3b",
+    "variant_id": "v2_fixed_blend",
+    "start_time": "2026-07-16T16:35:51+12:00",
+    "end_time": "2026-07-17T11:28:53+12:00",
+    "status": "completed",
+    "wall_clock_seconds": 67950.0,
+    "peak_gpu_memory_allocated_gb": 8.476,
+    "peak_gpu_memory_reserved_gb": 8.984,
+    "global_step": 934
+  },
+  "3b-v4_full_hrpo_gate": {
+    "model_size": "3b",
+    "variant_id": "v4_full_hrpo_gate",
+    "start_time": "2026-07-17T04:21:15+12:00",
+    "end_time": "2026-07-18T00:29:20+12:00",
+    "status": "completed",
+    "wall_clock_seconds": 72452.9,
+    "peak_gpu_memory_allocated_gb": 8.513,
+    "peak_gpu_memory_reserved_gb": 9.002,
+    "global_step": 934
+  },
+  "3b-v6_hrpo_full": {
+    "model_size": "3b",
+    "variant_id": "v6_hrpo_full",
+    "start_time": "2026-07-17T11:29:07+12:00",
+    "end_time": "2026-07-18T04:52:53+12:00",
+    "status": "completed",
+    "wall_clock_seconds": 62581.4,
+    "peak_gpu_memory_allocated_gb": 8.506,
+    "peak_gpu_memory_reserved_gb": 8.986,
+    "global_step": 934
+  }
+}

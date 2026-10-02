@@ -12,6 +12,92 @@ from tqdm import tqdm
 from utils import *
 
 
+def load_model_for_eval(model_path: str, adapter_path: str, gate_mode: str = "standard",
+                        task: str = "gsm8k"):
+    """Load a base model (+ optional adapter) with the gate configuration it was
+    trained with, ready for generation. Returns (model, tokenizer).
+
+    This is the body evaluate_model always ran, moved out unchanged so that the
+    sampled pass@k evaluation (eval_passk.py) loads checkpoints through the SAME
+    code: a wrong gate mode makes an accuracy meaningless, so there must be one
+    place that decides it. See evaluate_model for what each gate_mode means."""
+    model, tokenizer = FastLanguageModel.from_pretrained(
+        model_name = model_path,
+        # MATH decodes 1024 new tokens on top of the prompt; 1024 total
+        # would truncate. (eval_math.py uses 1536 for the same reason.)
+        max_seq_length = 1536 if task == "math" else 1024,
+        load_in_4bit = False,
+        fast_inference = False,
+    )
+    model.answer_start = ANSWER_START
+    tokenizer.padding_side = "left"
+    tokenizer.pad_token = tokenizer.eos_token
+
+    u_init = None
+    if gate_mode == "constant":
+        # u must exist on thinking_residual_Lambda BEFORE the adapter is loaded,
+        # exactly as in training (register_constant_latent_vector precedes
+        # get_peft_model). Register it afterwards and the checkpoint's u has no
+        # parameter to land in: it is dropped, u stays at its init, and the run
+        # is evaluated with a vector it never trained. Keep the init value so
+        # the load can be verified below.
+        from variant_common import register_constant_latent_vector, get_inner_model
+        register_constant_latent_vector(model)
+        u_init = get_inner_model(model).thinking_residual_Lambda.u.detach().clone()
+
+    if adapter_path is not None:
+        model.load_adapter(adapter_path)
+    if gate_mode == "disabled":
+        model.answer_start = ""
+    elif gate_mode == "unit":
+        from variant_common import apply_unit_gate_patch
+        apply_unit_gate_patch(model)
+    elif gate_mode == "constant":
+        from variant_common import apply_constant_latent_patch, get_inner_model
+        apply_constant_latent_patch(model)
+        if adapter_path is not None:
+            # A silently-dropped u is the failure this whole branch exists to
+            # prevent, and it is invisible in the accuracy number — so make it
+            # loud. Training moves u (it sits in Lambda's 1e-3 group), so a
+            # bit-identical u means the checkpoint's value never arrived.
+            u_now = get_inner_model(model).thinking_residual_Lambda.u.detach()
+            if torch.equal(u_now, u_init.to(u_now.device)):
+                raise RuntimeError(
+                    f"gate_mode='constant': u is bit-identical to its init after "
+                    f"loading {adapter_path} — the checkpoint's learned u was not "
+                    f"applied, so this evaluation would use the wrong latent "
+                    f"vector. Check that the adapter carries a "
+                    f"'thinking_residual_Lambda...u' key.")
+    elif gate_mode != "standard":
+        raise ValueError(f"Unknown gate_mode: {gate_mode}")
+    model = FastLanguageModel.for_inference(model)
+    return model, tokenizer
+
+
+def get_task_spec(task: str):
+    """(dataset, q_key, a_key, max_new, answer_fn, gold_fn) for a task.
+
+    GSM8K and MATH share the system prompt, the "####" answer marker and
+    extract_from_response; they differ only in the split, the field holding the
+    gold answer, how that field becomes a comparable answer, and the decode
+    budget (MATH solutions are longer). Moved out of evaluate_model unchanged so
+    eval_passk.py scores with the same comparators."""
+    if task == "gsm8k":
+        dataset = load_dataset('openai/gsm8k', 'main')['test']
+        q_key, a_key, max_new = 'question', 'answer', 512
+        answer_fn = process_gsm8k_answer
+        gold_fn = lambda gold: process_gsm8k_answer(extract_hash_answer(gold))
+    elif task == "math":
+        # MATH-500 (or a local MATH test split): 'problem' + boxed 'solution'.
+        dataset = load_math500()
+        q_key, a_key, max_new = 'problem', 'solution', 1024
+        answer_fn = process_math_answer
+        gold_fn = lambda gold: process_math_answer(extract_boxed_answer(gold) or "")
+    else:
+        raise ValueError(f"unknown task {task!r}; expected 'gsm8k' or 'math'")
+    return dataset, q_key, a_key, max_new, answer_fn, gold_fn
+
+
 def evaluate_model(
     model_path: str,
     adapter_path: str,
@@ -20,21 +106,26 @@ def evaluate_model(
     batch_size: int = 4,
     num_samples: int = None,
     save_results: bool = True,
+    gate_mode: str = "standard",
+    save_path: str = None,
+    task: str = "gsm8k",
 ):
-    model, tokenizer = FastLanguageModel.from_pretrained(
-        model_name = model_path,
-        max_seq_length = 1024,
-        load_in_4bit = False,
-        fast_inference = False,
-    )
-    model.answer_start = ANSWER_START
-    tokenizer.padding_side = "left"
-    tokenizer.pad_token = tokenizer.eos_token
-
-    model.load_adapter(adapter_path)
-    model = FastLanguageModel.for_inference(model)
-
-    dataset = load_dataset('openai/gsm8k', 'main')['test']
+    """gate_mode selects the gate configuration used at inference and must
+    mirror how the checkpoint was trained (see changes.md mapping #7):
+      - "standard": stock HRPO gate (v4/v5/v6 and the legacy checkpoints);
+      - "unit":     r_t = i_t = 1 via the unit-gate patch (v2/v3);
+      - "constant": unit gates AND the Eq.3 projection replaced by the learned
+                    vector u (v7 / tier-8 arm C1). Without this, a C1
+                    checkpoint would be evaluated with the projection it was
+                    never trained with and its accuracy would be meaningless;
+      - "disabled": no hybrid blending at all (v1 and base zero-shot —
+                    without an HRPO-trained adapter the gate weights are
+                    random and must not run).
+    adapter_path=None evaluates the base model zero-shot (save_path required
+    if save_results). Defaults reproduce the original behaviour exactly.
+    """
+    model, tokenizer = load_model_for_eval(model_path, adapter_path, gate_mode, task)
+    dataset, q_key, a_key, max_new, answer_fn, gold_fn = get_task_spec(task)
     if num_samples and len(dataset) > num_samples:
         dataset = dataset.shuffle(seed=42).select(range(num_samples))
     total_samples = len(dataset)
@@ -55,7 +146,7 @@ def evaluate_model(
     # Process samples in batches
     for i in range(0, total_samples, batch_size):
         batch_data = dataset[i:i + batch_size]
-        current_batch_size = len(batch_data['question'])
+        current_batch_size = len(batch_data[q_key])
 
         # Prepare prompts using the same format as training
         prompts = [
@@ -63,7 +154,7 @@ def evaluate_model(
                 {'role': 'system', 'content': SYSTEM_PROMPT},
                 {'role': 'user', 'content': q.strip()},
             ]
-            for q in batch_data['question']
+            for q in batch_data[q_key]
         ]
 
         # Convert chat prompts to the required format
@@ -90,7 +181,7 @@ def evaluate_model(
             generation_config=GenerationConfig(
                 do_sample=True,  # for temperature, top-k, etc.
                 temperature=temperature,
-                max_new_tokens=512,
+                max_new_tokens=max_new,
             ),
             processing_class=tokenizer,
             is_inference=is_inference,
@@ -105,14 +196,13 @@ def evaluate_model(
 
             # Extract the generated answer using XML tags
             extracted = extract_from_response(response)
-            generated_answer = process_gsm8k_answer(extracted)
-            true_answer = extract_hash_answer(batch_data['answer'][j])
-            true_answer = process_gsm8k_answer(true_answer)
+            generated_answer = answer_fn(extracted)
+            true_answer = gold_fn(batch_data[a_key][j])
             print(generated_answer, true_answer, generated_answer == true_answer)
 
             # Store the result
             result = {
-                'question': batch_data['question'][j],
+                'question': batch_data[q_key][j],
                 'true_answer': true_answer,
                 'generated_answer': generated_answer,
                 'full_response': response,
@@ -137,11 +227,15 @@ def evaluate_model(
         'correct': correct,
         'total': total,
         'model_path': adapter_path,
+        'base_model': model_path,
+        'gate_mode': gate_mode,
+        'task': task,
         'timestamp': datetime.now().isoformat()
     }
 
     if save_results:
-        save_path = adapter_path + "/eval_results.json"
+        if save_path is None:
+            save_path = adapter_path + "/eval_results.json"
         with open(save_path, 'w') as f:
             json.dump({'metrics': metrics, 'results': results}, f, indent=2)
         print(f"\nResults saved to {save_path}")

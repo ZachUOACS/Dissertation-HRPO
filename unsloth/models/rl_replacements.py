@@ -234,7 +234,7 @@ pass
 RL_FUNCTIONS["grpo_trainer"].append(grpo_trainer__get_per_token_logps)
 
 # Custom compiled GRPO loss - creates 3 Triton kernels
-def grpo_compute_loss(old_logits, new_logits, input_ids, mask, beta, advantages):
+def grpo_compute_loss(old_logits, new_logits, input_ids, mask, beta, advantages, loss_norm_constant = None):
     # All Unsloth Zoo code licensed under LGPLv3
     old_logits = old_logits.to(torch.float32)
     new_logits = new_logits.to(torch.float32)
@@ -263,7 +263,16 @@ def grpo_compute_loss(old_logits, new_logits, input_ids, mask, beta, advantages)
     n_mask_per_reward = mask.sum(1)
 
     # See https://github.com/huggingface/trl/pull/2881
-    loss_per_reward = (loss_i * mask).sum(1) / n_mask_per_reward
+    if loss_norm_constant is None:
+        loss_per_reward = (loss_i * mask).sum(1) / n_mask_per_reward
+    else:
+        # Dr. GRPO (Liu et al. 2025, "Understanding R1-Zero-Like Training"):
+        # divide by a CONSTANT (max completion length) instead of each response's
+        # own token count. Per-response normalisation gives every token of a long
+        # response a smaller weight, so a long wrong answer is penalised less per
+        # token than a short one - a bias towards longer incorrect completions.
+        # None (the default, set by nothing) is the original GRPO loss.
+        loss_per_reward = (loss_i * mask).sum(1) / loss_norm_constant
     loss = loss_per_reward.mean()  # per-response loss
     # loss = (loss_i * mask).sum() / mask.sum()  # per-token loss
     
@@ -289,7 +298,7 @@ RL_REPLACEMENTS["grpo_compute_loss_slow"] = \
 class UnslothEfficientGRPO(torch.autograd.Function):
     # All Unsloth Zoo code licensed under LGPLv3
     @staticmethod
-    def forward(ctx, _new_hidden_states, _old_hidden_states, lm_head, _input_ids, _mask, _advantages, beta, scaler = None, n_chunks = 1):
+    def forward(ctx, _new_hidden_states, _old_hidden_states, lm_head, _input_ids, _mask, _advantages, beta, scaler = None, n_chunks = 1, loss_norm_constant = None):
         def compute_loss(new_hidden_states, old_hidden_states, input_ids, mask, advantages, scaling):
             new_logits = torch.matmul(new_hidden_states, lm_head.t())
             new_logits = new_logits[:, :-1, :] # exclude the last logit: it corresponds to the next token pred
@@ -297,6 +306,7 @@ class UnslothEfficientGRPO(torch.autograd.Function):
             old_logits = old_logits[:, :-1, :] # exclude the last logit: it corresponds to the next token pred
             loss, completion_length, mean_kl = grpo_compute_loss(
                 old_logits, new_logits, input_ids, mask, beta, advantages,
+                loss_norm_constant,
             )
             # Scale loss if needed for mixed precision training
             scaled_loss = loss * scaling
@@ -370,7 +380,7 @@ class UnslothEfficientGRPO(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_output, dcompletion_length, dmean_kl):
         (grad_input,) = ctx.saved_tensors
-        return (grad_input, None, None, None, None, None, None, None, None,)
+        return (grad_input, None, None, None, None, None, None, None, None, None,)
     pass
 pass
 RL_REPLACEMENTS["UnslothEfficientGRPO"] = UnslothEfficientGRPO
@@ -413,7 +423,8 @@ def grpo_accumulated_loss(
             new_hidden_states, old_hidden_states, lm_head,
             completion_input_ids, completion_mask, advantages, trainer.beta,
             trainer.accelerator.scaler,
-            n_chunks, 
+            n_chunks,
+            getattr(trainer, "dr_grpo_len_constant", None),
         )
         return loss, completion_length, mean_kl
 
@@ -424,6 +435,7 @@ def grpo_accumulated_loss(
         old_logits = old_logits[:, :-1, :] # exclude the last logit: it corresponds to the next token pred
         loss, completion_length, mean_kl = grpo_compute_loss(
             old_logits, new_logits, completion_input_ids, completion_mask, trainer.beta, advantages,
+            getattr(trainer, "dr_grpo_len_constant", None),
         )
         return loss, completion_length, mean_kl
     pass
@@ -475,6 +487,7 @@ def grpo_trainer_compute_loss(function_name, function):
         if per_token_logps is not None:
             loss, completion_length, mean_kl = grpo_compute_loss_slow(
                 ref_per_token_logps, per_token_logps, input_ids, completion_mask, self.beta, advantages,
+                getattr(self, "dr_grpo_len_constant", None),
             )
         else:
             loss, completion_length, mean_kl = grpo_accumulated_loss(

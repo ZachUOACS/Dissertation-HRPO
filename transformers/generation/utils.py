@@ -115,6 +115,33 @@ if TYPE_CHECKING:
 
 logger = logging.get_logger(__name__)
 
+
+def hrpo_project_latent(probs, embed_weight):
+    """HRPO Equation 3 — project a next-token distribution back onto the
+    embedding manifold:  h = W_e^T p / ||p||_2
+
+    Extracted verbatim from the _sample loop below so that teacher-forced callers
+    (stage0_warmstart.py, which has no generation loop to produce these latents)
+    use the SAME code path as the RL rollout instead of a second implementation
+    that could silently drift from it.
+
+    The operation order is preserved exactly — einsum, then an in-place divide by
+    the L2 norm cast to the result dtype — so generation stays bit-identical to
+    the pre-extraction code. tests/test_projection_extraction.py asserts that.
+
+    probs:        (..., vocab) — already softmaxed, AFTER any logits processors.
+    embed_weight: (vocab, dim) — the input-embedding matrix W_e.
+    returns:      (..., dim)
+
+    Leading dimensions beyond the last are flattened and restored, so this works
+    for a single decode step (batch, vocab) and for a full teacher-forced
+    sequence (batch, seq, vocab) alike.
+    """
+    flat = probs.reshape(-1, probs.shape[-1])
+    out = torch.einsum('bv,vd->bd', flat, embed_weight)
+    out /= torch.sqrt((flat ** 2).sum(-1, keepdim=True)).to(out.dtype)
+    return out.reshape(*probs.shape[:-1], out.shape[-1])
+
 if is_accelerate_available():
     from accelerate.hooks import AlignDevicesHook, add_hook_to_module
 
@@ -3366,10 +3393,11 @@ class GenerationMixin:
 
             strs = processing_class.batch_decode(input_ids[:, input_len:])
             is_thinking = [self.answer_start not in s for s in strs]
-            last_thinking_states = torch.einsum(
-                'bv,vd->bd', probs, self.get_input_embeddings().weight
+            # Eq.3. Same computation as before, now via the shared helper so the
+            # teacher-forced Stage-0 path cannot drift from the rollout path.
+            last_thinking_states = hrpo_project_latent(
+                probs, self.get_input_embeddings().weight
             )
-            last_thinking_states /= torch.sqrt((probs ** 2).sum(-1, keepdim=True)).to(last_thinking_states.dtype)
 
             if return_thinking_embeds and outputs.hidden_states is not None:
                 thinking_embeds.append(outputs.hidden_states[0].unsqueeze(1))

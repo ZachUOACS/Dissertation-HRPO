@@ -1,0 +1,24 @@
+# requirements_analysis.txt — extra packages needed ONLY for the post-training
+# analysis pipeline (eval_all.py, analyse_gate.py, analyse_failures.py,
+# generate_report.py). Install on top of requirements_train.txt:
+#
+#   export https_proxy=http://squid.auckland.ac.nz:3128
+#   export http_proxy=http://squid.auckland.ac.nz:3128
+#   pip install -r requirements_analysis.txt
+#
+# The proxy exports are REQUIRED on the cluster: they are set inside the SLURM
+# job scripts but not in an interactive login shell, so without them pip gets
+# "Connection reset by peer" from PyPI.
+#
+# Everything else the analysis needs (numpy, scipy, scikit-learn, pandas,
+# safetensors) is already pinned in requirements_train.txt.
+
+# Unpinned lower bound: only used for plotting, so any recent 3.x is fine and
+# a hard pin risks "no matching distribution" on the cluster's Python build.
+matplotlib>=3.7
+
+# Optional: faster HuggingFace downloads for Xet-backed repos. Without it the
+# hub falls back to plain HTTP, which is slower and (behind a proxy) can fail
+# partway through a large weight file — that is what broke the 0.5b base
+# model download.
+hf_xet

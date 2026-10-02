@@ -643,7 +643,14 @@ class GRPOTrainer(Trainer):
         # Normalize the rewards to compute the advantages
         mean_grouped_rewards = mean_grouped_rewards.repeat_interleave(self.num_generations, dim=0)
         std_grouped_rewards = std_grouped_rewards.repeat_interleave(self.num_generations, dim=0)
-        advantages = (rewards - mean_grouped_rewards) / (std_grouped_rewards + 1e-4)
+        if getattr(self, "dr_grpo_scale_rewards", True):
+            advantages = (rewards - mean_grouped_rewards) / (std_grouped_rewards + 1e-4)
+        else:
+            # Dr. GRPO (Liu et al. 2025): no per-group std normalisation. Dividing by
+            # the std up-weights questions whose group nearly agrees (all right or all
+            # wrong, std -> 0) - a question-difficulty bias. The attribute is set only
+            # by variant_common.apply_dr_grpo; when absent this is the original GRPO.
+            advantages = rewards - mean_grouped_rewards
 
         # Slice to keep only the local part of the data
         process_slice = slice(
