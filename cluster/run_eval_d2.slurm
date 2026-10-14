@@ -30,8 +30,16 @@ source .venv/bin/activate
 #                  their Dr. GRPO baselines. k times the cost of a greedy eval, so give it
 #                  time:  sbatch --time=36:00:00 --export=ALL,PASSK=8 cluster/run_eval_d2.slurm
 #                  Already-finished files are skipped, so it is safe to resubmit.
+#   QUANT=1        weight-only quantisation study (eval_quant.py): the Dr. GRPO arms with their
+#                  weights merged and quantised (bf16 reference, int8, int4, nf4), blend on and,
+#                  for latent arms, off; then analyse_quant.py. Runs tests/test_weight_quant.py
+#                  first and stops if it fails. About 30 min per MATH evaluation.
 if [[ "${LATENT_OFF:-0}" == "1" ]]; then
     python eval_d2.py --latent_off ${EXTRA_EVAL_ARGS:-}
+elif [[ "${QUANT:-0}" == "1" ]]; then
+    python -m pytest tests/test_weight_quant.py -q || exit 1
+    python eval_quant.py ${EXTRA_EVAL_ARGS:-}
+    python analyse_quant.py
 elif [[ "${PASSK:-0}" != "0" ]]; then
     python eval_d2.py --passk "${PASSK}" ${EXTRA_EVAL_ARGS:-}
     python analyse_d2.py

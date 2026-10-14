@@ -30,7 +30,10 @@ from variant_common import GATE_MODES, MODEL_NAMES, parse_experiment_name
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("exp_dir")
-    parser.add_argument("--batch_size", type=int, default=16)
+    # The settled results were produced with eval_all.py --batch_size 32
+    # (cluster/run_eval_and_analysis.slurm). Greedy decoding in bf16 depends on the padding
+    # of the batch, so the check is only meaningful at the same batch size.
+    parser.add_argument("--batch_size", type=int, default=32)
     args = parser.parse_args()
 
     exp_dir = args.exp_dir.rstrip("/")
@@ -69,9 +72,11 @@ def main():
     print(f"\nsettled : {old['metrics']['correct']}/{old['metrics']['total']}")
     print(f"refactor: {new['metrics']['correct']}/{new['metrics']['total']}")
     print(f"questions whose correctness changed: {flipped}; whose extracted answer changed: {text_diff}")
-    os.remove(scratch)
     if len(old_vec) != len(new_vec) or flipped:
-        sys.exit("MISMATCH: do not trust new evaluations until this is explained")
+        # keep the scratch file: it is the evidence needed to explain the difference
+        sys.exit(f"MISMATCH (batch size {args.batch_size}): do not trust new evaluations until this "
+                 f"is explained; re-scored answers kept in {scratch}")
+    os.remove(scratch)
     print("IDENTICAL: the refactor did not change the greedy evaluation")
 
 

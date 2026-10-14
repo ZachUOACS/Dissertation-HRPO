@@ -234,7 +234,8 @@ pass
 RL_FUNCTIONS["grpo_trainer"].append(grpo_trainer__get_per_token_logps)
 
 # Custom compiled GRPO loss - creates 3 Triton kernels
-def grpo_compute_loss(old_logits, new_logits, input_ids, mask, beta, advantages, loss_norm_constant = None):
+def grpo_compute_loss(old_logits, new_logits, input_ids, mask, beta, advantages, loss_norm_constant = None,
+                      soft_ids = None, soft_w = None):
     # All Unsloth Zoo code licensed under LGPLv3
     old_logits = old_logits.to(torch.float32)
     new_logits = new_logits.to(torch.float32)
@@ -244,7 +245,8 @@ def grpo_compute_loss(old_logits, new_logits, input_ids, mask, beta, advantages,
     old_x = torch.gather(old_logits, dim = -1, index = input_ids).squeeze(-1)
     new_x = torch.gather(new_logits, dim = -1, index = input_ids).squeeze(-1)
     old = old_x - torch.logsumexp(old_logits, dim = -1)
-    new = new_x - torch.logsumexp(new_logits, dim = -1)
+    new_lse = torch.logsumexp(new_logits, dim = -1)
+    new = new_x - new_lse
 
     # Reverse KL
     kl_i = torch.exp(old - new) - (old - new) - 1.0
@@ -254,9 +256,20 @@ def grpo_compute_loss(old_logits, new_logits, input_ids, mask, beta, advantages,
     # Below is forward KL (normal KL)
     # kl_i = torch.exp(old) * (old - new)
 
+    # Stochastic latent (LEPO-style, Zhou et al. 2026, Eq. 9): where the rollout used a sampled
+    # latent, the policy-gradient target is the soft label sum_k w_k log pi(k) instead of the
+    # one-hot token. Positions without a latent carry a one-hot label, which gives exactly the
+    # token's log-probability. None (every other arm) leaves the original term untouched. The KL
+    # term stays on the sampled token.
+    if soft_ids is not None:
+        pg = (torch.gather(new_logits, dim = -1, index = soft_ids) * soft_w).sum(-1) \
+            - new_lse * soft_w.sum(-1)
+    else:
+        pg = new
+
     # Must detach - otherwise gradients are not propagated correctly!
     # exp(x - x) == 1
-    loss_i = torch.exp(new - new.detach()) * advantages.unsqueeze(1)
+    loss_i = torch.exp(pg - pg.detach()) * advantages.unsqueeze(1)
     loss_i = -(loss_i - beta * kl_i)
 
     mask = mask.to(torch.float32)
@@ -298,15 +311,15 @@ RL_REPLACEMENTS["grpo_compute_loss_slow"] = \
 class UnslothEfficientGRPO(torch.autograd.Function):
     # All Unsloth Zoo code licensed under LGPLv3
     @staticmethod
-    def forward(ctx, _new_hidden_states, _old_hidden_states, lm_head, _input_ids, _mask, _advantages, beta, scaler = None, n_chunks = 1, loss_norm_constant = None):
-        def compute_loss(new_hidden_states, old_hidden_states, input_ids, mask, advantages, scaling):
+    def forward(ctx, _new_hidden_states, _old_hidden_states, lm_head, _input_ids, _mask, _advantages, beta, scaler = None, n_chunks = 1, loss_norm_constant = None, _soft_ids = None, _soft_w = None):
+        def compute_loss(new_hidden_states, old_hidden_states, input_ids, mask, advantages, scaling, soft_ids, soft_w):
             new_logits = torch.matmul(new_hidden_states, lm_head.t())
             new_logits = new_logits[:, :-1, :] # exclude the last logit: it corresponds to the next token pred
             old_logits = torch.matmul(old_hidden_states, lm_head.t())
             old_logits = old_logits[:, :-1, :] # exclude the last logit: it corresponds to the next token pred
             loss, completion_length, mean_kl = grpo_compute_loss(
                 old_logits, new_logits, input_ids, mask, beta, advantages,
-                loss_norm_constant,
+                loss_norm_constant, soft_ids, soft_w,
             )
             # Scale loss if needed for mixed precision training
             scaled_loss = loss * scaling
@@ -320,12 +333,12 @@ class UnslothEfficientGRPO(torch.autograd.Function):
         accumulated_completion_length = torch.zeros(1, device = device)
         accumulated_mean_kl           = torch.zeros(1, device = device)
 
-        def accumulate_chunk(new_hidden_states_j, old_hidden_states_j, input_ids_j, mask_j, advantages_j, scaling):
+        def accumulate_chunk(new_hidden_states_j, old_hidden_states_j, input_ids_j, mask_j, advantages_j, scaling, soft_ids_j = None, soft_w_j = None):
             (chunk_grad_input,), (chunk_loss, (unscaled_loss, chunk_completion_length, chunk_mean_kl,)) = torch.func.grad_and_value(
                 compute_loss,
                 argnums = (0,),
                 has_aux = True,
-            )(new_hidden_states_j, old_hidden_states_j, input_ids_j, mask_j, advantages_j, scaling)
+            )(new_hidden_states_j, old_hidden_states_j, input_ids_j, mask_j, advantages_j, scaling, soft_ids_j, soft_w_j)
             accumulated_loss             .add_(unscaled_loss)
             accumulated_completion_length.add_(chunk_completion_length)
             accumulated_mean_kl          .add_(chunk_mean_kl)
@@ -344,6 +357,9 @@ class UnslothEfficientGRPO(torch.autograd.Function):
         input_ids          = torch.chunk(_input_ids,         chunks = n_chunks, dim = 0)
         mask               = torch.chunk(_mask,              chunks = n_chunks, dim = 0)
         advantages         = torch.chunk(_advantages,        chunks = n_chunks, dim = 0)
+        # soft labels of the stochastic latent; None for every other arm
+        soft_ids = torch.chunk(_soft_ids, chunks = n_chunks, dim = 0) if _soft_ids is not None else [None] * len(advantages)
+        soft_w   = torch.chunk(_soft_w,   chunks = n_chunks, dim = 0) if _soft_w   is not None else [None] * len(advantages)
 
         # Get mixed precision scaling if seen
         scaling = scaler.get_scale() if scaler is not None else 1.0
@@ -351,16 +367,19 @@ class UnslothEfficientGRPO(torch.autograd.Function):
         # Force torch.compile to use dynamic shapes for seqlen dim
         mark_dynamic = lambda x: torch._dynamo.mark_dynamic(x, 1)
 
-        for (grad_inputs_j, new_hidden_states_j, old_hidden_states_j, input_ids_j, mask_j, advantages_j,) in \
-            zip(grad_inputs_chunks, new_hidden_states, old_hidden_states, input_ids, mask, advantages):
+        for (grad_inputs_j, new_hidden_states_j, old_hidden_states_j, input_ids_j, mask_j, advantages_j, soft_ids_j, soft_w_j,) in \
+            zip(grad_inputs_chunks, new_hidden_states, old_hidden_states, input_ids, mask, advantages, soft_ids, soft_w):
 
             mark_dynamic(new_hidden_states_j)
             mark_dynamic(old_hidden_states_j)
             mark_dynamic(input_ids_j)
             mark_dynamic(mask_j)
+            if soft_ids_j is not None:
+                mark_dynamic(soft_ids_j)
+                mark_dynamic(soft_w_j)
 
             grad_inputs_j.copy_(
-                accumulate_chunk(new_hidden_states_j, old_hidden_states_j, input_ids_j, mask_j, advantages_j, scaling)
+                accumulate_chunk(new_hidden_states_j, old_hidden_states_j, input_ids_j, mask_j, advantages_j, scaling, soft_ids_j, soft_w_j)
             )
         pass
 
@@ -380,7 +399,9 @@ class UnslothEfficientGRPO(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_output, dcompletion_length, dmean_kl):
         (grad_input,) = ctx.saved_tensors
-        return (grad_input, None, None, None, None, None, None, None, None, None,)
+        # one entry per forward input; autograd drops surplus trailing Nones when a caller passed
+        # fewer arguments (the soft-label inputs are optional)
+        return (grad_input, None, None, None, None, None, None, None, None, None, None, None,)
     pass
 pass
 RL_REPLACEMENTS["UnslothEfficientGRPO"] = UnslothEfficientGRPO
@@ -396,6 +417,8 @@ def grpo_accumulated_loss(
     completion_mask,
     advantages,
     n_chunks = -1,
+    soft_ids = None,
+    soft_w = None,
 ):
     # All Unsloth Zoo code licensed under LGPLv3
     bsz, qlen = input_ids.shape
@@ -425,6 +448,8 @@ def grpo_accumulated_loss(
             trainer.accelerator.scaler,
             n_chunks,
             getattr(trainer, "dr_grpo_len_constant", None),
+            soft_ids,
+            soft_w,
         )
         return loss, completion_length, mean_kl
 
@@ -484,15 +509,19 @@ def grpo_trainer_compute_loss(function_name, function):
         # per_token_loss = -(per_token_loss - self.beta * per_token_kl)
         # loss = ((per_token_loss * completion_mask).sum(dim=1) / completion_mask.sum(dim=1)).mean()
         input_ids = input_ids[:, -logits_to_keep:]
+        # soft labels of the stochastic latent (None for every other arm)
+        latent_soft_ids = inputs.get("latent_soft_ids", None)
+        latent_soft_w = inputs.get("latent_soft_w", None)
         if per_token_logps is not None:
             loss, completion_length, mean_kl = grpo_compute_loss_slow(
                 ref_per_token_logps, per_token_logps, input_ids, completion_mask, self.beta, advantages,
-                getattr(self, "dr_grpo_len_constant", None),
+                getattr(self, "dr_grpo_len_constant", None), latent_soft_ids, latent_soft_w,
             )
         else:
             loss, completion_length, mean_kl = grpo_accumulated_loss(
                 self, _input_ids, _thinking_embeds, thinking_mask, logits_to_keep, completion_mask, advantages,
                 n_chunks = self.args.unsloth_num_chunks,
+                soft_ids = latent_soft_ids, soft_w = latent_soft_w,
             )
 
         # Log the metrics
@@ -517,6 +546,33 @@ def grpo_trainer_compute_loss(function_name, function):
             self._metrics["hidden_ratio"].append(mean_hidden_ratio.item())
             self._metrics["completion_length"].append(completion_length.item())
             self._metrics["kl"].append(mean_kl.item())
+        # D3 (variant_common.apply_blend_gate): with the gated blend, positions where the gate is
+        # closed report a ratio of exactly 1 and drop out of the means above, so also log the share
+        # of latent positions that were blended and the mean blend weight over all of them.
+        # Off for every other arm, so their logged metrics are unchanged.
+        if getattr(self, "blend_gate_on", False):
+            _tm = thinking_mask.bool()
+            _er = embeds_ratio.to(_tm.device)
+            _n = _tm.sum().clamp(min = 1)
+            blend_share = ((_er < 1.) & _tm).sum() / _n
+            blend_beta = (1. - _er)[_tm].sum() / _n
+            _m = self._metrics[("eval" if self.control.should_evaluate else "train")] \
+                if "train" in self._metrics else self._metrics
+            _m["blend_share"].append(blend_share.item())
+            _m["blend_beta"].append(blend_beta.item())
+        # Stochastic latent: how soft the loss targets were. soft_share = share of completion tokens
+        # whose label is not one-hot; soft_mass = mean weight off the sampled token over all
+        # completion tokens. Off for every other arm.
+        if latent_soft_w is not None:
+            _cm = completion_mask.bool()
+            _off = (1. - latent_soft_w[..., 0])
+            _n = _cm.sum().clamp(min = 1)
+            soft_share = ((_off > 0) & _cm).sum() / _n
+            soft_mass = _off[_cm].sum() / _n
+            _m = self._metrics[("eval" if self.control.should_evaluate else "train")] \
+                if "train" in self._metrics else self._metrics
+            _m["latent_soft_share"].append(soft_share.item())
+            _m["latent_soft_mass"].append(soft_mass.item())
         return loss
     pass
 

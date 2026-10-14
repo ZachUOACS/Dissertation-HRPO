@@ -13,14 +13,25 @@ from utils import *
 
 
 def load_model_for_eval(model_path: str, adapter_path: str, gate_mode: str = "standard",
-                        task: str = "gsm8k"):
+                        task: str = "gsm8k", latent_temperature: float = None,
+                        blend_gate: dict = None, weight_quant: str = None):
     """Load a base model (+ optional adapter) with the gate configuration it was
     trained with, ready for generation. Returns (model, tokenizer).
 
     This is the body evaluate_model always ran, moved out unchanged so that the
     sampled pass@k evaluation (eval_passk.py) loads checkpoints through the SAME
     code: a wrong gate mode makes an accuracy meaningless, so there must be one
-    place that decides it. See evaluate_model for what each gate_mode means."""
+    place that decides it. See evaluate_model for what each gate_mode means.
+
+    latent_temperature: the Eq.3 mixture temperature the run was trained with
+    (--latent_temperature); None (default) mixes over the sampling distribution,
+    the original behaviour.
+    blend_gate: the D3 settings the run was trained with, as a dict with keys
+    blend_gate / blend_max / blend_d0 / blend_d1 (None = the variant's own blend).
+    Ignored when gate_mode is "disabled" (latent-off), where nothing is blended.
+    weight_quant: None (default) leaves the weights alone; otherwise a weight_quant.SCHEMES
+    name: the LoRA adapters are merged and the block projections quantised in place, and the
+    stats are left on model.weight_quant_stats."""
     model, tokenizer = FastLanguageModel.from_pretrained(
         model_name = model_path,
         # MATH decodes 1024 new tokens on top of the prompt; 1024 total
@@ -70,7 +81,22 @@ def load_model_for_eval(model_path: str, adapter_path: str, gate_mode: str = "st
                     f"'thinking_residual_Lambda...u' key.")
     elif gate_mode != "standard":
         raise ValueError(f"Unknown gate_mode: {gate_mode}")
+    if latent_temperature is not None:
+        from variant_common import set_latent_temperature
+        set_latent_temperature(model, latent_temperature)
+    if blend_gate and gate_mode != "disabled":
+        # after the gate-mode patch above, which also overrides thinking_residual
+        from variant_common import set_blend_gate
+        set_blend_gate(model, **blend_gate)
+    quant_stats = None
+    if weight_quant is not None:
+        # before for_inference, so nothing it prepares can hold the unquantised weights
+        from weight_quant import apply_weight_quant
+        quant_stats = apply_weight_quant(model, weight_quant)
+        print(f"[weight_quant] {quant_stats}")
     model = FastLanguageModel.for_inference(model)
+    if quant_stats is not None:
+        model.weight_quant_stats = quant_stats
     return model, tokenizer
 
 
@@ -109,6 +135,9 @@ def evaluate_model(
     gate_mode: str = "standard",
     save_path: str = None,
     task: str = "gsm8k",
+    latent_temperature: float = None,
+    blend_gate: dict = None,
+    weight_quant: str = None,
 ):
     """gate_mode selects the gate configuration used at inference and must
     mirror how the checkpoint was trained (see changes.md mapping #7):
@@ -123,8 +152,12 @@ def evaluate_model(
                     random and must not run).
     adapter_path=None evaluates the base model zero-shot (save_path required
     if save_results). Defaults reproduce the original behaviour exactly.
+    weight_quant (see load_model_for_eval) also records each answer's generated token
+    count ('num_tokens', up to the first end-of-sequence token) and their mean.
     """
-    model, tokenizer = load_model_for_eval(model_path, adapter_path, gate_mode, task)
+    model, tokenizer = load_model_for_eval(model_path, adapter_path, gate_mode, task,
+                                           latent_temperature=latent_temperature,
+                                           blend_gate=blend_gate, weight_quant=weight_quant)
     dataset, q_key, a_key, max_new, answer_fn, gold_fn = get_task_spec(task)
     if num_samples and len(dataset) > num_samples:
         dataset = dataset.shuffle(seed=42).select(range(num_samples))
@@ -208,6 +241,10 @@ def evaluate_model(
                 'full_response': response,
                 'correct': generated_answer == true_answer
             }
+            if weight_quant is not None:
+                generated = output[prompt_length:]
+                ends = (generated == tokenizer.eos_token_id).nonzero()
+                result['num_tokens'] = int(ends[0, 0]) if len(ends) else int(generated.numel())
             results.append(result)
 
             if generated_answer == true_answer:
@@ -232,6 +269,15 @@ def evaluate_model(
         'task': task,
         'timestamp': datetime.now().isoformat()
     }
+    if latent_temperature is not None:
+        # only recorded when set, so every default results file keeps its old keys
+        metrics['latent_temperature'] = latent_temperature
+    if blend_gate and gate_mode != "disabled":
+        metrics['blend_gate'] = blend_gate
+    if weight_quant is not None:
+        metrics['weight_quant'] = model.weight_quant_stats
+        metrics['mean_tokens'] = (sum(r['num_tokens'] for r in results) / len(results)
+                                  if results else None)
 
     if save_results:
         if save_path is None:

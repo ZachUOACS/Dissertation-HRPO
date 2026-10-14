@@ -142,6 +142,66 @@ def hrpo_project_latent(probs, embed_weight):
     out /= torch.sqrt((flat ** 2).sum(-1, keepdim=True)).to(out.dtype)
     return out.reshape(*probs.shape[:-1], out.shape[-1])
 
+
+def hrpo_latent_probs(probs, next_token_scores, generation_config, latent_temperature=None):
+    """The distribution that HRPO Equation 3 mixes over.
+
+    In the released code the mixture is formed from `probs`, the sampling distribution, so the
+    sampling temperature (0.5) also sharpens the latent. With `latent_temperature` set, the
+    mixture is formed from the same processed scores re-tempered to `latent_temperature`
+    instead, while the sampled token is unchanged:
+
+        p_latent = softmax(s * tau_s / tau_latent)
+
+    where s are the scores after the logits processors and tau_s is the temperature the
+    TemperatureLogitsWarper applied (1.0 if it was not added). With the processors used here
+    (repetition penalty 1.0, temperature, top-k 50) this equals softmax(topk(logits) /
+    tau_latent): the support is the sampling support, only the temperature differs. Masked
+    tokens stay at -inf, so they keep zero weight.
+
+    latent_temperature=None returns `probs` itself, so the default path is unchanged.
+    """
+    if latent_temperature is None:
+        return probs
+    tau_s = 1.0
+    if (generation_config.do_sample and generation_config.temperature is not None
+            and generation_config.temperature != 1.0):
+        tau_s = generation_config.temperature
+    return nn.functional.softmax(next_token_scores * (tau_s / latent_temperature), dim=-1)
+
+
+def hrpo_gumbel_latent_step(probs, gumbel_temperature):
+    """Stochastic latent for the hybrid rollout (after LEPO, Zhou et al. 2026, Eq. 4).
+
+    The next token is drawn by the Gumbel-max trick, argmax(log p + g) with g ~ Gumbel(0, 1),
+    which samples from p exactly as torch.multinomial does. The latent's mixing weights reuse
+    the SAME noise, z = softmax((log p + g) / gumbel_temperature), so the latent varies between
+    the completions of a group and stays consistent with the token that was drawn (argmax z is
+    that token). Tokens outside the sampling support (p = 0) have log p = -inf and keep zero
+    weight. Returns (tokens, z)."""
+    logp = torch.log(probs)
+    u = torch.rand_like(probs).clamp_(min=1e-10, max=1.0 - 1e-7)
+    perturbed = logp - torch.log(-torch.log(u))
+    tokens = perturbed.argmax(dim=-1)
+    z = nn.functional.softmax(perturbed / gumbel_temperature, dim=-1)
+    return tokens, z
+
+
+def hrpo_soft_labels(z, tokens, use_soft, k=8):
+    """Top-k soft labels for the loss's latent term (LEPO Eq. 9).
+
+    Rows where use_soft is False (the latent is not used next, or the sequence has finished)
+    get the one-hot label of the sampled token, so the loss term reduces to that token's
+    log-probability exactly. Soft rows keep the k largest weights of z, renormalised to sum to
+    one; their first entry is the sampled token. Returns (indices, weights), each (B, k)."""
+    w, idx = torch.topk(z, k, dim=-1)
+    w = w / w.sum(dim=-1, keepdim=True)
+    onehot_idx = tokens.unsqueeze(-1).expand_as(idx)
+    onehot_w = torch.zeros_like(w)
+    onehot_w[:, 0] = 1.0
+    keep = use_soft.unsqueeze(-1)
+    return torch.where(keep, idx, onehot_idx), torch.where(keep, w, onehot_w)
+
 if is_accelerate_available():
     from accelerate.hooks import AlignDevicesHook, add_hook_to_module
 
@@ -3319,6 +3379,13 @@ class GenerationMixin:
         embeds_ratio = [
             torch.ones_like(input_ids, dtype=torch.float32, device=input_ids.device)
         ] if return_thinking_embeds else []
+        # Stochastic latent (model.stochastic_latent = Gumbel temperature; unset = None = off). Only
+        # in sampled rollouts: greedy evaluation keeps the deterministic Eq.3 mixture. The soft
+        # labels for the loss leave through self._latent_soft_labels (read by GRPOTrainer).
+        gumbel_tau = None if is_inference else getattr(self, "stochastic_latent", None)
+        soft_ids_steps, soft_w_steps = [], []
+        if gumbel_tau is not None:
+            self._latent_soft_labels = None
         while self._has_unfinished_sequences(this_peer_finished, synced_gpus, device=input_ids.device):
             # prepare model inputs
             model_inputs = self.prepare_inputs_for_generation(input_ids, **model_kwargs)
@@ -3376,13 +3443,17 @@ class GenerationMixin:
 
             # token selection
             probs = nn.functional.softmax(next_token_scores, dim=-1)
+            gumbel_z = None
             if is_inference:
                 next_tokens = torch.argmax(probs, dim=-1)
+            elif gumbel_tau is not None:
+                next_tokens, gumbel_z = hrpo_gumbel_latent_step(probs, gumbel_tau)
             else:
                 # TODO (joao): this OP throws "skipping cudagraphs due to ['incompatible ops']", find solution
                 next_tokens = torch.multinomial(probs, num_samples=1).squeeze(1)
 
             # finished sentences should have their next token be a padding token
+            was_unfinished = unfinished_sequences.bool()
             if has_eos_stopping_criteria:
                 next_tokens = next_tokens * unfinished_sequences + pad_token_id * (1 - unfinished_sequences)
 
@@ -3395,9 +3466,21 @@ class GenerationMixin:
             is_thinking = [self.answer_start not in s for s in strs]
             # Eq.3. Same computation as before, now via the shared helper so the
             # teacher-forced Stage-0 path cannot drift from the rollout path.
-            last_thinking_states = hrpo_project_latent(
-                probs, self.get_input_embeddings().weight
-            )
+            # model.latent_temperature (unset = None) decouples the mixture's temperature from
+            # the sampling temperature; None mixes over `probs` exactly as before.
+            if gumbel_z is not None:
+                # the latent is the stochastic mixture; its soft labels are kept for the loss
+                last_thinking_states = hrpo_project_latent(gumbel_z, self.get_input_embeddings().weight)
+                use_soft = torch.tensor(is_thinking, device=input_ids.device) & was_unfinished
+                step_ids, step_w = hrpo_soft_labels(gumbel_z, next_tokens, use_soft)
+                soft_ids_steps.append(step_ids)
+                soft_w_steps.append(step_w)
+            else:
+                last_thinking_states = hrpo_project_latent(
+                    hrpo_latent_probs(probs, next_token_scores, generation_config,
+                                      getattr(self, "latent_temperature", None)),
+                    self.get_input_embeddings().weight,
+                )
 
             if return_thinking_embeds and outputs.hidden_states is not None:
                 thinking_embeds.append(outputs.hidden_states[0].unsqueeze(1))
@@ -3418,6 +3501,11 @@ class GenerationMixin:
 
         if streamer is not None:
             streamer.end()
+
+        if soft_ids_steps:
+            # (B, completion_length, k): step j is the label for completion token j
+            self._latent_soft_labels = (torch.stack(soft_ids_steps, dim=1),
+                                        torch.stack(soft_w_steps, dim=1))
 
         if return_dict_in_generate:
             if self.config.is_encoder_decoder:

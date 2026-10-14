@@ -38,8 +38,51 @@ from variant_common import GATE_MODES, MODEL_NAMES, training_incomplete
 
 NEW_RE = re.compile(
     r"^new-(?P<size>0\.5b|1\.5b|3b)-(?P<variant>v\d_[a-z_]+?)"
-    r"(?P<suffix>-(?:seed|rp|lora|warm|dr|ds|t|lr|noise).*)?$"
+    r"(?P<suffix>-(?:seed|rp|lora|warm|dr|ds|t|lr|noise|lt|sl|dg|lp).*)?$"
 )
+
+
+def get_run_blend_gate(exp_dir):
+    """The D3 blend settings a run trained with, as the keyword dict set_blend_gate takes, or
+    None. train_summary.json first; the "-dg{max}d{d0}to{d1}" directory token is the fallback,
+    so a gated run is never evaluated with the ungated blend."""
+    summary_path = os.path.join(exp_dir, "train_summary.json")
+    if os.path.exists(summary_path):
+        try:
+            with open(summary_path) as f:
+                a = json.load(f)["args"]
+            if a.get("blend_gate", "off") != "off":
+                return {"blend_gate": a["blend_gate"], "blend_max": float(a["blend_max"]),
+                        "blend_d0": float(a["blend_d0"]), "blend_d1": float(a["blend_d1"])}
+            if "blend_gate" in a:
+                return None
+        except (KeyError, ValueError, TypeError, json.JSONDecodeError):
+            pass
+    num = r"(\d+(?:\.\d+)?(?:e-?\d+)?)"
+    m = re.search(rf"-dg{num}d{num}to{num}", os.path.basename(exp_dir))
+    if m:
+        return {"blend_gate": "divergence", "blend_max": float(m.group(1)),
+                "blend_d0": float(m.group(2)), "blend_d1": float(m.group(3))}
+    return None
+
+
+def get_run_latent_temperature(exp_dir):
+    """The Eq.3 mixture temperature a run trained with (--latent_temperature), or None.
+
+    Read from train_summary.json like the sampling temperature; the "-lt{value}"
+    directory token is the fallback, so a run whose summary is missing is still
+    evaluated with the mixture it was trained with, never silently at the default."""
+    summary_path = os.path.join(exp_dir, "train_summary.json")
+    if os.path.exists(summary_path):
+        try:
+            with open(summary_path) as f:
+                value = json.load(f)["args"].get("latent_temperature")
+            if value is not None:
+                return float(value)
+        except (KeyError, ValueError, json.JSONDecodeError):
+            pass
+    m = re.search(r"-lt([\d.]+)", os.path.basename(exp_dir))
+    return float(m.group(1).rstrip(".")) if m else None
 
 
 def discover_new_runs():
@@ -65,6 +108,8 @@ def discover_new_runs():
             "checkpoint": ckpt,
             "gate_mode": GATE_MODES.get(variant, "standard"),
             "temperature": get_run_temperature(exp_dir),
+            "latent_temperature": get_run_latent_temperature(exp_dir),
+            "blend_gate": get_run_blend_gate(exp_dir),
             "task": "math" if "-dsmath" in suffix else "gsm8k",
             "training_complete": True,
         })
@@ -124,6 +169,8 @@ def run_missing_passk(runs, k, batch_size, num_samples, sample_seed):
                 save_path=save_path,
                 task=task,
                 sample_seed=sample_seed,
+                latent_temperature=run.get("latent_temperature"),
+                blend_gate=run.get("blend_gate"),
             )
         except Exception as exc:                      # noqa: BLE001
             print(f"[FAIL] {label}: {type(exc).__name__}: {exc}")
@@ -146,7 +193,12 @@ def main():
                              "the new arms AND their Dr. GRPO baselines, written to "
                              "eval_results_pass{k}.json. Never touches eval_results.json.")
     parser.add_argument("--sample_seed", type=int, default=0)
-    parser.add_argument("--batch_size", type=int, default=16)
+    # 32 is not a tuning choice: every settled greedy result was produced by
+    # `eval_all.py --batch_size 32` (cluster/run_eval_and_analysis.slurm), and in bf16 the
+    # greedy decode depends on how prompts are padded together. At 16 the same checkpoint
+    # (1.5b-v3_learned_lambda-rp1-drboth) scored 959/1319 against its settled 968/1319,
+    # with 149 questions changing correctness. New arms must be scored like their baselines.
+    parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--num_samples", type=int, default=None,
                         help="Smoke runs only; full = 1319 (GSM8K) / 500 (MATH)")
     parser.add_argument("--latent_off", action="store_true",
@@ -154,20 +206,28 @@ def main():
                              "writes eval_results_latent_off.json beside the normal one")
     parser.add_argument("--variants", nargs="+", default=None,
                         help="Only runs whose id contains one of these substrings")
+    parser.add_argument("--exact", action="store_true",
+                        help="with --variants: match run ids exactly instead of by substring, so a "
+                             "baseline id does not also select every new arm built on it")
     args = parser.parse_args()
+
+    def selected(variant_id):
+        if args.exact:
+            return variant_id in args.variants
+        return any(v in variant_id for v in args.variants)
 
     runs = discover_new_runs()
     if args.variants:
-        runs = [r for r in runs if any(v in r["variant_id"] for v in args.variants)]
+        runs = [r for r in runs if selected(r["variant_id"])]
     print(f"Discovered {len(runs)} evaluable new-arm experiments:")
     for r in runs:
-        print(f"  {r['model_size']:>5} {r['variant_id']:<58} temp={r['temperature']}")
+        print(f"  {r['model_size']:>5} {r['variant_id']:<58} temp={r['temperature']}"
+              f" latent_temp={r['latent_temperature']} blend_gate={r['blend_gate']}")
 
     if args.passk > 0:
         baselines = discover_baselines()
         if args.variants:
-            baselines = [r for r in baselines
-                         if any(v in r["variant_id"] for v in args.variants)]
+            baselines = [r for r in baselines if selected(r["variant_id"])]
         print(f"plus {len(baselines)} Dr. GRPO baseline(s) for the sampled evaluation:")
         for r in baselines:
             print(f"  {r['model_size']:>5} {r['variant_id']:<58} temp={r['temperature']}")

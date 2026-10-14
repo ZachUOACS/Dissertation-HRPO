@@ -202,6 +202,46 @@ def build_arg_parser(variant_id: str) -> argparse.ArgumentParser:
     parser.add_argument("--noise_mode", type=str, default="add",
                         choices=["add", "mult"])
 
+    # Decoupled latent temperature. HRPO's Eq.3 mixture is formed from the sampling
+    # distribution, so the sampling temperature (0.5) also sharpens the latent. With
+    # this set, the mixture is formed from the same top-k scores re-tempered to this
+    # value, while tokens are still sampled at --temperature (see
+    # transformers/generation/utils.py::hrpo_latent_probs). Rollout only: the loss
+    # replays the stored blended inputs, and evaluation must form the mixture the
+    # same way (eval_d2 reads it from train_summary.json). None (default) is the
+    # original behaviour. A run with it set is a new arm ("new-...-lt{value}").
+    parser.add_argument("--latent_temperature", type=float, default=None)
+
+    # D3: uncertainty-gated blend. Replaces HRPO's Eq.4 blend (whose Lambda and gates were shown
+    # to be inert) with a convex blend whose weight depends on how far the latent departs from
+    # the embedding of the token it accompanies:
+    #   d_t = 1 - cos(h_t, e_t),  beta_t = blend_max * clamp((d_t - d0) / (d1 - d0), 0, 1),
+    #   input_t = (1 - beta_t) * e_t + beta_t * h_t.
+    # Where the model was confident, h_t ~ e_t, d_t ~ 0 and the input is the plain token; where it
+    # was uncertain the latent is blended in strongly. d_t needs only (e_t, h_t), which both the
+    # rollout and the loss forward already have, so the patch covers both call sites with no new
+    # buffer. d0/d1 come from the calibration in probe_latent_temp.py --calibrate. "off" (default)
+    # leaves the variant's own blend untouched. A run with it on is a new arm ("new-...-dg{max}").
+    # C1: stochastic latent with its own gradient (after LEPO, Zhou et al. 2026). In sampled
+    # rollouts the token is drawn by the Gumbel-max trick (same distribution as before) and the
+    # latent is the Gumbel-softmax of the SAME noise at this temperature, so the latent differs
+    # between the completions of a group. In the loss, positions whose latent was used take the
+    # soft label sum_k z_k log pi(k) as the policy-gradient target (LEPO Eq. 9) instead of the
+    # one-hot token; elsewhere the target is the token, exactly as before. Greedy evaluation
+    # keeps the deterministic Eq.3 mixture. None (default) is off. LEPO used 0.3 (3B) and 0.5
+    # (7B) and reports gains for 0.3 to 0.6. A run with it set is a new arm ("new-...-sl{T}").
+    parser.add_argument("--stochastic_latent", type=float, default=None)
+    # Length penalty (Arora & Zanette 2025, arXiv 2502.04463; length_penalty.py): a correct
+    # response earns 1 - alpha * sigmoid((len - mean) / std), mean and std over the correct
+    # responses of its own group; incorrect responses earn 0 as before. alpha in (0, 1); the paper
+    # used 0.05, 0.1, 0.2 and 0.4 with an RLOO estimator, which Dr. GRPO's advantage matches. None
+    # (default) is off. A run with it set is a new arm ("new-...-lp{alpha}").
+    parser.add_argument("--length_penalty_alpha", type=float, default=None)
+    parser.add_argument("--blend_gate", type=str, default="off", choices=["off", "divergence"])
+    parser.add_argument("--blend_max", type=float, default=0.5)
+    parser.add_argument("--blend_d0", type=float, default=None)
+    parser.add_argument("--blend_d1", type=float, default=None)
+
     # Stage-0 warm start: directory produced by stage0_warmstart.py whose LoRA
     # adapter + Lambda are loaded before RL begins. Recorded in the config
     # fingerprint so a run started from a warm start can never silently resume as
@@ -296,6 +336,18 @@ def experiment_dir(model_size: str, variant_id: str, args=None) -> str:
             if getattr(args, "noise_mode", "add") != "add":
                 tag += args.noise_mode
             new_tokens.append(tag)
+        latent_temperature = getattr(args, "latent_temperature", None)
+        if latent_temperature is not None:
+            new_tokens.append(f"-lt{latent_temperature:g}")
+        stochastic_latent = getattr(args, "stochastic_latent", None)
+        if stochastic_latent is not None:
+            new_tokens.append(f"-sl{stochastic_latent:g}")
+        if getattr(args, "blend_gate", "off") != "off":
+            new_tokens.append(f"-dg{getattr(args, 'blend_max', 0.5):g}"
+                              f"d{args.blend_d0:g}to{args.blend_d1:g}")
+        length_alpha = getattr(args, "length_penalty_alpha", None)
+        if length_alpha is not None:
+            new_tokens.append(f"-lp{length_alpha:g}")
         if new_tokens:
             name = "new-" + name + "".join(new_tokens)
     return f"./experiments/{name}"
@@ -365,6 +417,9 @@ _CONFIG_FINGERPRINT = [
     "lora_targets", "latent_source", "constant_init", "init_from",
     "dr_grpo", "dataset",
     "noise_sigma_start", "noise_sigma_end", "noise_stages", "noise_mode",
+    "latent_temperature", "stochastic_latent",
+    "blend_gate", "blend_max", "blend_d0", "blend_d1",
+    "length_penalty_alpha",
 ]
 # Value to assume when a run_config.json predates a fingerprint key. Without it
 # every checkpoint written before C2 would refuse to resume ("dr_grpo:
@@ -372,7 +427,10 @@ _CONFIG_FINGERPRINT = [
 # The noise keys follow the same rule: every earlier run trained without noise.
 _FINGERPRINT_DEFAULTS = {"dr_grpo": "off", "dataset": "gsm8k",
                          "noise_sigma_start": 0.0, "noise_sigma_end": None,
-                         "noise_stages": 10, "noise_mode": "add"}
+                         "noise_stages": 10, "noise_mode": "add",
+                         "latent_temperature": None, "stochastic_latent": None,
+                         "blend_gate": "off", "blend_max": 0.5, "blend_d0": None, "blend_d1": None,
+                         "length_penalty_alpha": None}
 
 _DR_GRPO_MODES = ("off", "len", "std", "both")
 
@@ -430,6 +488,149 @@ def apply_exploration_noise(trainer, args):
     print(f"[noise] RMSNorm weight noise on: sigma {sigma_start:g} -> {sigma_end:g} "
           f"over {getattr(args, 'noise_stages', 10)} stages, mode="
           f"{getattr(args, 'noise_mode', 'add')}")
+
+
+def set_latent_temperature(model, latent_temperature):
+    """Set the Eq.3 mixture temperature on the module whose _sample loop builds the
+    mixture: the causal-LM object that carries `answer_start` (set by every variant
+    script and by the evaluation loader before any PEFT wrapping). Returns the number
+    of modules set.
+
+    None sets nothing, so the rollout keeps mixing over the sampling distribution.
+    A latent temperature on a model whose answer_start is "" (v1, or latent-off
+    evaluation) would be accepted and do nothing, so that combination is refused."""
+    if latent_temperature is None:
+        return 0
+    if latent_temperature <= 0:
+        raise ValueError(f"latent_temperature must be > 0, got {latent_temperature}")
+    targets = [m for m in model.modules() if "answer_start" in vars(m)]
+    if not targets:
+        raise RuntimeError("set_latent_temperature: no module carries answer_start; the "
+                           "latent temperature would not reach the rollout")
+    if all(m.answer_start == "" for m in targets):
+        raise RuntimeError("set_latent_temperature: answer_start is empty (v1 or latent-off), "
+                           "so there is no latent mixture for the temperature to act on")
+    for m in targets:
+        m.latent_temperature = float(latent_temperature)
+    return len(targets)
+
+
+def divergence_gate_weights(embeds, residual, blend_max, d0, d1):
+    """D3 blend weight per position: beta = blend_max * clamp((d - d0) / (d1 - d0), 0, 1) with
+    d = 1 - cos(latent, token embedding), computed in fp32. No parameter receives gradient through
+    it (the embedding table is frozen and the latent is a stored constant in the loss forward).
+    Returns beta with a trailing singleton dimension, broadcastable over the hidden size."""
+    cos = torch.nn.functional.cosine_similarity(embeds.float(), residual.float(), dim=-1)
+    d = 1.0 - cos
+    beta = blend_max * torch.clamp((d - d0) / (d1 - d0), 0.0, 1.0)
+    return beta.unsqueeze(-1)
+
+
+def _divergence_gate_thinking_residual(self, embeds, residual, eps=1e-8):
+    """D3 blend, replacing Eq.4 at BOTH call sites (rollout unsloth/models/llama.py:944 and the
+    loss forward llama.py:666): input = (1 - beta) * e + beta * h. Returns (input, a_t) with
+    a_t = 1 - beta, the token's weight, so the existing embeds_ratio logging records the blend
+    (positions with beta = 0 report 1, exactly like non-latent positions)."""
+    beta = divergence_gate_weights(embeds, residual, self.blend_max, self.blend_d0, self.blend_d1)
+    beta = beta.to(embeds.dtype)
+    a_t = (1 - beta).expand_as(embeds)
+    return (1 - beta) * embeds + beta * residual.to(embeds.dtype), a_t
+
+
+def set_blend_gate(model, blend_gate="off", blend_max=0.5, blend_d0=None, blend_d1=None):
+    """Install the D3 blend on the module that owns thinking_residual. "off" does nothing.
+    Must run AFTER any gate-mode patch (the v3 unit-gate patch also overrides
+    thinking_residual) and at evaluation as well as training. Returns True when installed."""
+    if blend_gate in (None, "off"):
+        return False
+    if blend_gate != "divergence":
+        raise ValueError(f"unknown blend_gate {blend_gate!r}")
+    if blend_d0 is None or blend_d1 is None or not (0 <= blend_d0 < blend_d1):
+        raise ValueError(f"blend_gate needs 0 <= blend_d0 < blend_d1, got {blend_d0}, {blend_d1}")
+    if not (0 < blend_max <= 1):
+        raise ValueError(f"blend_max must be in (0, 1], got {blend_max}")
+    holders = [m for m in model.modules() if "answer_start" in vars(m)]
+    if holders and all(m.answer_start == "" for m in holders):
+        raise RuntimeError("set_blend_gate: answer_start is empty (v1 or latent-off), so no "
+                           "latent is blended and the gate would do nothing")
+    inner = get_inner_model(model)
+    inner.blend_max, inner.blend_d0, inner.blend_d1 = float(blend_max), float(blend_d0), float(blend_d1)
+    inner.thinking_residual = types.MethodType(_divergence_gate_thinking_residual, inner)
+    return True
+
+
+def apply_blend_gate(trainer, args):
+    """D3 for a trainer. Off (default) touches nothing. Also flags the trainer so the loss logs
+    the share of latent positions that were blended (unsloth/models/rl_replacements.py)."""
+    if getattr(args, "blend_gate", "off") == "off":
+        return
+    set_blend_gate(trainer.model, args.blend_gate, args.blend_max, args.blend_d0, args.blend_d1)
+    trainer.blend_gate_on = True
+    print(f"[blend_gate] D3 divergence-gated blend: beta = {args.blend_max:g} * clamp((d - "
+          f"{args.blend_d0:g}) / ({args.blend_d1:g} - {args.blend_d0:g}), 0, 1), "
+          f"d = 1 - cos(latent, token); replaces the Eq.4 blend at rollout and in the loss")
+
+
+def set_stochastic_latent(model, gumbel_temperature):
+    """Set the Gumbel temperature of the C1 stochastic latent on the module that runs _sample
+    (the one carrying answer_start). None sets nothing. Refused where there is no latent (v1,
+    latent-off). Returns the number of modules set."""
+    if gumbel_temperature is None:
+        return 0
+    if gumbel_temperature <= 0:
+        raise ValueError(f"stochastic_latent must be > 0, got {gumbel_temperature}")
+    targets = [m for m in model.modules() if "answer_start" in vars(m)]
+    if not targets:
+        raise RuntimeError("set_stochastic_latent: no module carries answer_start; the setting "
+                           "would not reach the rollout")
+    if all(m.answer_start == "" for m in targets):
+        raise RuntimeError("set_stochastic_latent: answer_start is empty (v1 or latent-off), so "
+                           "there is no latent to make stochastic")
+    for m in targets:
+        m.stochastic_latent = float(gumbel_temperature)
+    return len(targets)
+
+
+def apply_stochastic_latent(trainer, args):
+    """C1 for a trainer. Off (None) touches nothing. Flags the trainer so GRPOTrainer collects
+    the rollout's soft labels and the loss logs how soft they were."""
+    tau = getattr(args, "stochastic_latent", None)
+    if tau is None:
+        return
+    if getattr(args, "latent_temperature", None) is not None:
+        raise SystemExit("--stochastic_latent and --latent_temperature both form the latent; "
+                         "use one of them")
+    n = set_stochastic_latent(trainer.model, tau)
+    trainer.stochastic_latent_on = True
+    print(f"[stochastic_latent] Gumbel latent at temperature {tau:g} with the soft-label "
+          f"policy-gradient term at latent positions; set on {n} module(s)")
+
+
+def apply_length_penalty(trainer, args):
+    """Length-penalised reward (length_penalty.py) for a trainer. Off (None) touches nothing.
+    GRPOTrainer._prepare_inputs reads trainer.length_penalty_alpha; the penalty itself refuses
+    any reward that is not 0/1, so it can never silently reshape v5/v6's shaped rewards."""
+    alpha = getattr(args, "length_penalty_alpha", None)
+    if alpha is None:
+        return
+    if not 0.0 < alpha < 1.0:
+        raise SystemExit(f"--length_penalty_alpha must be in (0, 1), got {alpha}")
+    if not hasattr(trainer, "num_generations"):
+        raise RuntimeError("apply_length_penalty needs a GRPOTrainer (no num_generations)")
+    trainer.length_penalty_alpha = float(alpha)
+    print(f"[length_penalty] correct responses earn 1 - {alpha:g} * sigmoid(normalised length within "
+          f"the group's correct responses); advantage /std="
+          f"{getattr(trainer, 'dr_grpo_scale_rewards', True)}")
+
+
+def apply_latent_temperature(trainer, args):
+    """Decoupled latent temperature for a trainer's rollouts. Off (None) touches nothing."""
+    latent_temperature = getattr(args, "latent_temperature", None)
+    if latent_temperature is None:
+        return
+    n = set_latent_temperature(trainer.model, latent_temperature)
+    print(f"[latent_temperature] Eq.3 mixture at temperature {latent_temperature:g} "
+          f"(sampling stays at {getattr(args, 'temperature', 0.5):g}); set on {n} module(s)")
 
 
 def training_incomplete(exp_dir: str):
@@ -509,6 +710,14 @@ def train_with_resume(trainer, exp_dir: str, args):
     apply_dr_grpo(trainer, getattr(args, "dr_grpo", "off"))
     # D2 exploration noise, same reason: the one call every variant shares.
     apply_exploration_noise(trainer, args)
+    # Decoupled latent temperature, same reason.
+    apply_latent_temperature(trainer, args)
+    # D3 uncertainty-gated blend, same reason (after the variant script's own gate patch).
+    apply_blend_gate(trainer, args)
+    # C1 stochastic latent with its own gradient, same reason.
+    apply_stochastic_latent(trainer, args)
+    # Length penalty, same reason.
+    apply_length_penalty(trainer, args)
 
     trainer.train(resume_from_checkpoint=resume)
 

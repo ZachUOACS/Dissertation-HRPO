@@ -2012,3 +2012,230 @@ cluster) and everything that touches a GPU.
 
 Verified locally (no torch here): passk_utils tests, naming tests' logic, and analyse_d2 end to end on SYNTHETIC
 experiment directories. Not verified: anything that loads a model.
+
+### D2 outcome and the decoupled latent temperature (2026-10-07)
+
+D2 RESULT (exploration noise, settled): 4 of 5 comparisons below the same-seed Dr. GRPO baseline. GSM8K v1 s42
+-0.91 (p 0.44), v1 s43 -1.90 (p 0.074), v3 s42 -0.76 (p 0.52); MATH v1 s43 +1.20 (p 0.59), MATH v3 s43 -3.40
+(p 0.090). The lr 1e-5 probe (-8.57) is a training collapse at about step 380 (reward 0.79 -> 0.18, completion
+length 265 -> 445, KL median 10 after step 500). No further noise runs.
+
+NEW ARM: --latent_temperature. HRPO's Eq.3 mixture was formed from the sampling distribution, so the sampling
+temperature (0.5) also sharpened the latent. With --latent_temperature T the mixture is formed from the same
+processed scores re-tempered to T (softmax(scores * tau_s / T): same top-k support, same sampled token), while
+tokens are still sampled at --temperature.
+* transformers/generation/utils.py: new hrpo_latent_probs(); _sample passes its output to hrpo_project_latent.
+  The temperature is read from model.latent_temperature (unset = None), and None returns `probs` itself, so every
+  existing arm runs the identical computation. Rollout only: the loss replays the stored blended inputs.
+* variant_common.py: --latent_temperature (default None); experiment_dir appends "-lt{T}" and therefore the
+  "new-" prefix; fingerprinted with default None; set_latent_temperature() sets it on the module carrying
+  answer_start and REFUSES a model whose answer_start is "" (v1 or latent-off), where it would do nothing;
+  apply_latent_temperature() is called in train_with_resume beside the Dr. GRPO and noise switches.
+* Evaluation must form the mixture as the run was trained: eval_gsm8k.load_model_for_eval / evaluate_model and
+  eval_passk.evaluate_model_sampled take latent_temperature; eval_all.run_missing_evals passes the run's value
+  (never with latent-off); eval_d2 reads it from train_summary.json (fallback: the "-lt" token). Results files
+  record latent_temperature only when it is set, so default files keep their old keys.
+* probe_latent_temp.py + cluster/run_latent_probe.slurm: go/no-go before any training. Part A measures, at latent
+  positions of greedy decodes of the cold v3 checkpoints, how many tokens the mixture effectively combines at the
+  trained temperature and re-tempered (taken from inside the generation loop by wrapping hrpo_latent_probs, so the
+  processors really in effect are included). Part B re-scores the three cold v3 MATH checkpoints with the mixture
+  at T (no training; eval_results_lt{T}.json beside each eval_results.json). Decision rule fixed in its docstring.
+* cluster/submit_d2.sh: `latent` tier (MATH v3, seeds 43 44 by default). run_variant.slurm: --latent_temperature
+  runs evaluate themselves at the end like the other D2 axes.
+* tests/test_latent_temperature.py: default path returns probs itself; equality with HF's own processors at the
+  latent temperature (with and without repetition penalty, and with sampling at 1.0); support and argmax unchanged;
+  naming, analyse_d2 pairing, fingerprint; the setter reaches the right module and refuses v1.
+
+Verified locally (no torch here): syntax of every edited file, and the naming / fingerprint / eval_d2 parsing with
+torch stubbed. NOT verified: tests/test_latent_temperature.py (needs torch; run on the cluster) and anything that
+loads a model.
+
+### Latent temperature outcome and D3, the uncertainty-gated blend (2026-10-09)
+
+LATENT TEMPERATURE RESULT: stopped by its pre-set rule. MATH v3 with --latent_temperature 1.0: seed 43 51.60 vs
+51.60 (0.00, p 0.91), seed 44 49.60 vs 52.20 (-2.60, p 0.21); seed 42 cancelled because it could not change the
+verdict. Probe (job 27072): the trained mixture at temperature 0.5 has median effective size 1.00 tokens and mean
+cosine 0.988 with the top token's embedding, so the latent is almost a copy of the token; re-tempering to 1.0 changes
+it mainly at the ~25% of positions where the model is uncertain.
+
+NEW ARM: --blend_gate divergence (D3). Replaces HRPO's Eq.4 blend, whose Lambda and gates were shown to be inert
+(Lambda follows weight decay, the gate is a constant), with a convex blend weighted by how far the latent departs from
+the token it accompanies:
+    d_t = 1 - cos(h_t, e_t),  beta_t = blend_max * clamp((d_t - d0) / (d1 - d0), 0, 1),
+    input_t = (1 - beta_t) * e_t + beta_t * h_t.
+Where the model was confident the latent equals the token (d ~ 0) and the input is the plain token; where it was
+uncertain the latent is blended in at up to blend_max (default 0.5, against a fixed ~0.15 in HRPO).
+* Design choice: d_t needs only the token embedding and the stored latent, which BOTH call sites already have
+  (rollout unsloth/models/llama.py:944, loss forward llama.py:666). The gate is therefore an instance override of
+  thinking_residual, like the unit-gate and constant-vector patches, and needs no new rollout buffer and no change
+  to the trainer's data flow. Under greedy decoding the accompanying token is the argmax, so d is exactly the
+  1 - cos_top1 that the latent-temperature probe measures; under sampling it also fires where a non-argmax token
+  was sampled (the latent then carries the token the model preferred).
+* variant_common.py: --blend_gate {off,divergence}, --blend_max, --blend_d0, --blend_d1; "-dg{max}d{d0}to{d1}"
+  directory token with the "new-" prefix; fingerprinted with defaults off/0.5/None/None; divergence_gate_weights(),
+  set_blend_gate() (refuses v1/latent-off and invalid ramps) and apply_blend_gate(), called in train_with_resume
+  after the variant's own gate patch. "off" installs nothing.
+* unsloth/models/rl_replacements.py: when trainer.blend_gate_on, the loss also logs blend_share (share of latent
+  positions blended at all) and blend_beta (mean blend weight over latent positions). Every other arm logs exactly
+  what it did before.
+* Evaluation: load_model_for_eval / evaluate_model / evaluate_model_sampled take blend_gate (a dict of the four
+  settings), applied after the gate-mode patch and never with latent-off; eval_all passes run["blend_gate"];
+  eval_d2 reads it from train_summary.json (fallback: the "-dg" token).
+* probe_latent_temp.py --calibrate (cluster/run_latent_probe.slurm with SKIP_REGRESSION=1 PROBE_ARGS=--calibrate):
+  quantiles of d at latent positions on the three cold v3 MATH checkpoints, its Spearman correlation with the
+  mixture's effective size (does d track uncertainty?), and suggested d0 = 75th and d1 = 95th percentile, at the
+  trained and the latent temperature. Written to results/d3_gate_calibration.json.
+* cluster/submit_d2.sh: `d3` tier (needs D3_D0, D3_D1; D3_LT default 1.0 = gate plus latent temperature, "off" for
+  the gate alone; job names hrpo-d3-...). run_variant.slurm: --blend_gate runs evaluate themselves.
+* tests/test_blend_gate.py: zero weight when latent = token, full weight when orthogonal, linear ramp, convex output
+  with a_t = 1 - beta, identical blend for the rollout (B,1,d) and loss (N,d) layouts, bf16 preserved, Lambda not in
+  the graph, off/invalid/v1 handling, naming and fingerprint.
+
+Verified locally (no torch here): syntax of every edited file; naming, fingerprint and eval_d2 parsing with torch
+stubbed; the Spearman helper. NOT verified: tests/test_blend_gate.py (needs torch; run on the cluster) and anything
+that loads a model. No random-position control yet: it is only needed if the gated arm shows a gain.
+
+### C1: stochastic latent with its own gradient, after LEPO (2026-10-09)
+
+WHY: the ARS literature scan (Dissertation-document/research/latent_rl_candidates_scan.md) ranked this first. It
+targets the measured failure directly: HRPO's latent is a deterministic function of the sampled tokens and is replayed
+as a detached constant, so GRPO gets no within-group variation from it and never trains what the latent contains.
+LEPO (Zhou et al. 2026, arXiv 2604.17892; Eq. 4 and Eq. 9, read from the paper) samples latents by Gumbel-softmax and
+trains them with a soft-label policy-gradient term; at Qwen2.5-3B on MATH500 its Table 1 reads GRPO 61.00, HRPO 56.40,
+LEPO 63.23 (one run each).
+
+THE CHANGE (hybrid port, --stochastic_latent T; default None = off):
+* Rollout (transformers/generation/utils.py): hrpo_gumbel_latent_step() draws the token by the Gumbel-max trick,
+  argmax(log p + g), which samples from p exactly as torch.multinomial does, and forms the latent's weights from the
+  SAME noise, z = softmax((log p + g) / T). The latent is hrpo_project_latent(z). hrpo_soft_labels() keeps the top-8
+  weights of z (renormalised) at positions whose latent is used next (is_thinking and the row unfinished) and a one-hot
+  label of the sampled token elsewhere; the per-step labels leave _sample through model._latent_soft_labels.
+  Greedy evaluation (is_inference) never takes this path: evaluation keeps the deterministic Eq.3 mixture.
+* Trainer (trl/trainer/grpo_trainer.py _prepare_inputs): when trainer.stochastic_latent_on, collects the labels after
+  generate() and returns them as latent_soft_ids / latent_soft_w (None otherwise; raises if the flag is on and the
+  rollout left none).
+* Loss (unsloth/models/rl_replacements.py): grpo_compute_loss takes optional soft_ids / soft_w; the policy-gradient
+  term becomes sum_k w_k log pi(k) (LEPO Eq. 9) through the same exp(x - x.detach()) * A form; one-hot labels give
+  exactly the token term; the KL term stays on the sampled token. UnslothEfficientGRPO and grpo_accumulated_loss pass
+  the labels through the chunking (backward returns two extra trailing Nones; autograd drops surplus trailing Nones for
+  callers that pass fewer inputs, which tests/test_dr_grpo.py exercises). compute_loss logs latent_soft_share and
+  latent_soft_mass when labels are present.
+* variant_common.py: --stochastic_latent; "-sl{T}" token with the "new-" prefix; fingerprinted (default None);
+  set_stochastic_latent() (refuses v1 / latent-off) and apply_stochastic_latent() (refuses --latent_temperature at the
+  same time, since both form the latent) in train_with_resume. eval_d2 NEW_RE knows "sl"; run_variant.slurm evaluates
+  these runs at the end; submit_d2.sh tier `c1` (MATH v3, seeds 43 44, C1_TAU default 0.5, job prefix hrpo-c1).
+* Design choice: the soft label REPLACES the token target at latent positions instead of being added to it (LEPO's
+  latent phase has no discrete token; in the hybrid both exist). Adding it would double the gradient wherever z is
+  nearly one-hot, an effective learning-rate increase, and lr 1e-5 already collapsed (2026-10-07). Replacing it reduces
+  to the current loss wherever the latent is one token.
+* Default path: unchanged. _sample computes one extra boolean tensor per step that nothing reads; grpo_compute_loss's
+  default branch is the same expression (logsumexp now held in a variable).
+* tests/test_stochastic_latent.py: Gumbel-max frequencies match p (60,000 draws, tolerance 0.01) and never leave the
+  support; argmax z is the token; soft labels one-hot where no latent is used; one-hot labels reproduce the token loss
+  exactly (value) and its gradient; soft labels give the LEPO gradient; the efficient chunked loss is chunk-invariant
+  with labels and neutral with one-hot labels; setter refusals; naming and fingerprint.
+
+Verified locally (no torch here): syntax of every edited file; naming and fingerprint with torch stubbed. NOT verified:
+the tests (need torch; run on the cluster) and anything that runs a model.
+
+### eval_d2.py --exact (2026-10-11)
+With --variants, --exact matches run ids exactly instead of by substring. Without it, a baseline id such as
+v3_learned_lambda-seed43-rp1-drboth-dsmath also selects every new arm whose id starts with it (the C1, D3 and
+latent-temperature runs). Needed to run the sampled pass@8 evaluation on exactly C1 and its same-seed baseline.
+Seed-43 outcome recorded in Project_record.md 7d: D3 stopped (-2.20; early KL explosion against the token-only
+reference); C1 +1.20 with latent-off cost -0.40 (baseline -2.00), seeds 44 and 42 running.
+
+### Weight-only quantisation study (2026-10-12)
+Efficiency direction (user decision: keeping accuracy while saving memory, time or tokens is in scope). Question:
+does a hybrid latent model (v3) lose more or less than token-only GRPO (v1) when its weights are quantised for
+deployment, in accuracy and in reasoning length? Nearest work: Lotfi et al. 2026 (arXiv 2606.00206; PTQ lowers
+accuracy and lengthens CoT, with the error concentrated at high-entropy positions, where HRPO's latent differs from
+the token) and arXiv 2606.25519 (token inflation under INT4/INT3). Both study token reasoning models only.
+* weight_quant.py (new): after the adapter is loaded and before for_inference, merge the LoRA of every block
+  projection (q, k, v, o, gate, up, down) and replace each merged weight by quantise -> dequantise. Schemes: bf16
+  (merge only, the reference), int8 / int4 / int3 (asymmetric RTN, group 128, fp16 scale, b-bit zero point: the
+  GPTQ/AWQ RTN baseline), nf4 (bitsandbytes, blocksize 64, double-quantised statistics, as QLoRA and unsloth's
+  load_in_4bit). Embeddings (tied with lm_head), norms, biases and the HRPO gate stay bf16, so the latent is built
+  from unquantised embeddings and quantisation reaches it only through p. Raises unless exactly 7 projections per
+  layer are found. Weight memory is computed from the storage format (effective_bits), not measured: simulated
+  quantisation reproduces the numerics, not a quantised kernel's memory or speed.
+* Why simulated: unsloth's load_in_8bit routes to FastModel -> FastBaseModel (unsloth/models/loader.py:102,
+  vision.py), not the llama.py forward that holds the HRPO blend, and load_in_4bit would put the adapter, unmerged, on a remapped pre-quantised
+  download. Merging then quantising is also the deployment order of the PTQ papers.
+* eval_gsm8k.py: load_model_for_eval / evaluate_model take weight_quant (default None: unchanged). When set, each
+  result records num_tokens (generated ids before the first end-of-sequence token) and the metrics record the
+  scheme stats and mean_tokens.
+* eval_quant.py (new): default = the settled cold Dr. GRPO arms of --task (MATH), v1 and v3, all seeds; --variants
+  for exact ids (also searches the new-* arms); bf16 reference always included; latent-off for latent arms unless
+  --no_latent_off. Files: eval_results_wq-{scheme}.json and eval_results_wq-{scheme}_latent_off.json.
+* analyse_quant.py (new, standard library only): per checkpoint and scheme, accuracy change vs the bf16 reference
+  (McNemar), mean tokens and token inflation ratio (also on questions both answer correctly), latent-off gap, weight
+  GB; per arm, per-seed values and means with sign counts; v3 minus v1 quantisation cost per seed; merge check
+  (answers changed by merging alone vs eval_results.json). Writes results/quant_analysis.json.
+* cluster/run_eval_d2.slurm: QUANT=1 mode (runs tests/test_weight_quant.py first, stops on failure).
+* tests/test_weight_quant.py: RTN levels, half-step error bound, idempotence; only block projections change; wrong
+  projection count raises; LoRA merge preserves the function and int4 then quantises W + BA; NF4 equals bitsandbytes'
+  own Linear4bit (GPU only).
+
+Verified locally: syntax; analyse_quant.py on synthetic result files. NOT verified: the tests (need torch) and any
+model run.
+
+### Length penalty (2026-10-12)
+Efficiency direction, second study. Question: under the same length pressure, does HRPO (v3) shorten its
+reasoning at less accuracy cost than token-only GRPO (v1)? Motivation from our own data: in Study 2 Dr. GRPO's
+accuracy gain came with longer answers (correct +54, incorrect +124 tokens over training, 3/3 seeds), the opposite
+of Dr. GRPO's token-efficiency claim. Dr. GRPO removes GRPO's 1/|y| length normaliser; it adds no preference for
+short answers. This adds one.
+* Formula (Arora & Zanette 2025, arXiv 2502.04463, Eq. lenpen with sigmoid-normalised f; checked against the
+  arXiv LaTeX source): correct responses earn 1 - alpha * sigmoid((len - MEAN) / STD), MEAN and STD over the
+  correct responses of the prompt's own group; incorrect earn 0. Chosen over Kimi k1.5 (group min-max length
+  reward with an unreported weight), ALP (needs many rollouts per prompt for its solve rate; K = 16 in the paper,
+  we have 4) and DLER (truncation plus a changed training recipe) because its estimator is RLOO, which Dr.
+  GRPO's mean-centred advantage matches, so its tested alphas (0.05, 0.1, 0.2, 0.4) carry over; and a correct
+  answer always outranks an incorrect one.
+* length_penalty.py (new): the formula; length = completion_mask.sum(1) (tokens to the first EOS, latent
+  positions included); population std; single correct response or equal lengths -> f = 1/2 (no within-group
+  signal); raises on any reward other than 0/1, so v5/v6 shaped rewards are never silently rescaled.
+* trl/trainer/grpo_trainer.py: applied after the reward sum and before the group mean, only when
+  trainer.length_penalty_alpha is set. "reward" is still logged as the correctness reward, so curves compare
+  with every other arm; reward_shaped and length_f (mean sigmoid factor over correct responses) are logged
+  beside it. reward_std is the std of the shaped reward when on.
+* variant_common.py: --length_penalty_alpha (None = off); "-lp{alpha}" with the new- prefix; fingerprinted
+  (default None); apply_length_penalty in train_with_resume (refuses alpha outside (0, 1)).
+* eval_d2.py NEW_RE knows "lp"; run_variant.slurm evaluates these runs at the end; submit_d2.sh tier `length`
+  (MATH, v1 and v3, seeds 43 44, LP_ALPHA default 0.2, job prefix hrpo-lp).
+* eval_tokens.py (new, tokeniser only): greedy test tokens per answer from full_response, written to
+  eval_tokens.json beside each eval_results.json; analyse_d2.py reports the per-seed % change (testTok%).
+* tests/test_length_penalty.py: matches the formula written out per element; correct always beats incorrect and
+  shorter correct beats longer correct; no-signal cases; group independence; refusals; trainer hook guarded and
+  placed before the group mean; naming, fingerprint, setter, eval_d2 parsing.
+* Default path unchanged: with the attribute absent, rewards are untouched and the logged reward is the same
+  tensor.
+
+Verified locally: syntax. NOT verified: the tests (need torch) and any training run.
+Update 2026-10-14: tests/test_length_penalty.py passes locally (7 passed; CPU torch 2.5.1, peft 0.15.0,
+transformers 4.53.3, the cluster's pins). Still NOT verified: any training run.
+
+### Quantisation smoke test failures fixed (2026-10-14)
+The first QUANT=1 job stopped at its test step (3 failed, 8 passed). Reproduced locally with CPU torch 2.5.1 and
+peft 0.15.0 (the cluster's pins):
+* test_rtn_levels_error_and_idempotence[8]: re-quantising an int8 result moved weights by up to 2.3e-4 (about
+  half a step). Cause: the scale was rounded to fp16, so in some groups the top grid level fell short of the group
+  maximum and a second pass found a different range. Error bound itself held (max error / step = 0.500).
+* test_rtn_constant_group_and_shape_errors: an all-zero group came out NaN (scale clamped to 1e-8, which rounds
+  to 0 in fp16, then 0/0).
+* test_lora_merge_preserves_function_then_quantises_merged_weight: the test's stand-in config had no to_dict(),
+  and peft 0.15.0 reads tie_word_embeddings through it (tuners_utils._get_tied_target_modules). Test-only fault.
+Fix:
+* weight_quant.rtn_quantise now follows GPTQ's reference quantiser (IST-DASLab/gptq quant.py, find_params with
+  sym=False, then quantize) per group of 128: range widened to include 0, an all-zero group gets [-1, 1], fp32
+  arithmetic, scale not rounded to fp16 (the bf16 cast of the result rounds more coarsely). On groups that straddle
+  0 this is AWQ's pseudo_quantize_tensor grid as well. Storage accounting (effective_bits, fp16 scale + b-bit zero
+  per group) is unchanged.
+* On a random bf16 1536-wide weight the old and new versions give the same relative error to 5 decimals (int4
+  0.10075, int8 0.00622); 8.6% (int4) and 3.5% (int8) of weights land one level apart because of the scale
+  rounding. No quantised evaluation had been run with the old version.
+* tests: step bound uses the zero-widened range; one-signed constant groups (+-0.3) and a tiny-range group
+  (std 1e-6) added; stand-in config gets to_dict().
+Verified locally: tests/test_weight_quant.py 10 passed, 1 skipped (the NF4 test needs CUDA). NOT verified: the
+NF4 test and any model run.

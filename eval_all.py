@@ -233,6 +233,10 @@ def run_missing_evals(runs, batch_size, num_samples, sizes_present,
             gate_mode=gate_mode,
             save_path=save_path,
             task=run.get("task", "gsm8k"),
+            # Mixture temperature the run trained with (eval_d2 runs only; legacy runs
+            # carry no key -> None). Meaningless with the blend off, so not passed then.
+            latent_temperature=None if latent_off else run.get("latent_temperature"),
+            blend_gate=None if latent_off else run.get("blend_gate"),
         )
 
     if failures:

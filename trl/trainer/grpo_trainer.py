@@ -532,6 +532,7 @@ class GRPOTrainer(Trainer):
             prompt_mask = prompt_mask[:, -self.max_prompt_length :]
 
         # Generate completions using either vLLM or regular generation
+        latent_soft = None
         if self.args.use_vllm:
             # First, have main process load weights if needed
             if self.state.global_step != self._last_loaded_step:
@@ -567,6 +568,17 @@ class GRPOTrainer(Trainer):
                     processing_class=self.processing_class,
                     return_thinking_embeds=True,
                 )
+                # Stochastic latent (variant_common.apply_stochastic_latent): the rollout leaves its
+                # soft labels on the module that ran _sample. Absent for every other arm.
+                latent_soft = None
+                if getattr(self, "stochastic_latent_on", False):
+                    for _m in unwrapped_model.modules():
+                        if vars(_m).get("_latent_soft_labels") is not None:
+                            latent_soft = _m._latent_soft_labels
+                            _m._latent_soft_labels = None
+                            break
+                    if latent_soft is None:
+                        raise RuntimeError("stochastic latent is on but the rollout left no soft labels")
 
             # Compute prompt length and extract completion ids
             prompt_length = prompt_ids.size(1)
@@ -636,6 +648,17 @@ class GRPOTrainer(Trainer):
         # Apply weights to each reward function's output and sum
         rewards = (rewards_per_func * self.reward_weights.to(device).unsqueeze(0)).sum(dim=1)
 
+        # Length penalty (Arora & Zanette 2025; length_penalty.py): correct responses earn
+        # 1 - alpha * sigmoid(normalised length within the group's correct responses). Set only
+        # by variant_common.apply_length_penalty; when absent the rewards are untouched.
+        correctness_rewards = rewards
+        length_alpha = getattr(self, "length_penalty_alpha", None)
+        if length_alpha:
+            from length_penalty import length_penalised_rewards
+            lengths = gather(completion_mask.sum(dim=1))
+            rewards, length_f = length_penalised_rewards(rewards, lengths, self.num_generations,
+                                                         length_alpha)
+
         # Compute grouped-wise rewards
         mean_grouped_rewards = rewards.view(-1, self.num_generations).mean(dim=1)
         std_grouped_rewards = rewards.view(-1, self.num_generations).std(dim=1)
@@ -668,8 +691,15 @@ class GRPOTrainer(Trainer):
                 reward_func_name = reward_func.__name__
             self._metrics[f"rewards/{reward_func_name}"].append(reward_per_func[i].item())
 
-        self._metrics["reward"].append(rewards.mean().item())
+        # "reward" stays the correctness reward, so curves compare with every other arm;
+        # with the length penalty on, the shaped reward and the mean sigmoid factor over
+        # correct responses are logged beside it.
+        self._metrics["reward"].append(correctness_rewards.mean().item())
         self._metrics["reward_std"].append(std_grouped_rewards.mean().item())
+        if length_alpha:
+            n_correct = (correctness_rewards > 0.5).sum().clamp(min=1)
+            self._metrics["reward_shaped"].append(rewards.mean().item())
+            self._metrics["length_f"].append((length_f.sum() / n_correct).item())
 
         if (
             self.log_completions
@@ -700,6 +730,8 @@ class GRPOTrainer(Trainer):
             "embeds_ratio": embeds_ratio,
             "ref_per_token_logps": ref_per_token_logps,
             "advantages": advantages,
+            "latent_soft_ids": latent_soft[0] if latent_soft is not None else None,
+            "latent_soft_w": latent_soft[1] if latent_soft is not None else None,
         }
 
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):

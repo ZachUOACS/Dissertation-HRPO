@@ -46,8 +46,12 @@ def evaluate_model_sampled(
     save_path: str = None,
     task: str = "gsm8k",
     sample_seed: int = 0,
+    latent_temperature: float = None,
+    blend_gate: dict = None,
 ):
-    model, tokenizer = load_model_for_eval(model_path, adapter_path, gate_mode, task)
+    model, tokenizer = load_model_for_eval(model_path, adapter_path, gate_mode, task,
+                                           latent_temperature=latent_temperature,
+                                           blend_gate=blend_gate)
     dataset, q_key, a_key, max_new, answer_fn, gold_fn = get_task_spec(task)
     if num_samples and len(dataset) > num_samples:
         dataset = dataset.shuffle(seed=42).select(range(num_samples))
@@ -134,6 +138,10 @@ def evaluate_model_sampled(
         'task': task,
         'timestamp': datetime.now().isoformat(),
     })
+    if latent_temperature is not None:
+        metrics['latent_temperature'] = latent_temperature
+    if blend_gate:
+        metrics['blend_gate'] = blend_gate
     if save_path is None:
         save_path = f"{adapter_path}/eval_results_pass{k}.json"
     with open(save_path, 'w') as f:

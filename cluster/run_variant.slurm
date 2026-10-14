@@ -52,5 +52,17 @@ nvidia-smi --query-gpu=name,memory.total --format=csv,noheader || true
 # attention". Unquoted on purpose so it word-splits into separate arguments.
 echo "extra args: ${EXTRA_ARGS:-<none>}"
 ./run_ablations.sh --model_size "$MODEL_SIZE" --variant "v${VARIANT_NUM}" -- ${EXTRA_ARGS:-}
+train_status=$?
 
-echo "=== $(date -Is) done (exit $?) ==="
+# D2 programme: score finished experiments/new-* runs on this GPU before releasing it, so a result
+# never waits behind days of queued training. Only for runs that move the D2 axes (noise,
+# temperature, learning rate, latent temperature); eval_d2.py skips anything already evaluated or unfinished, so a
+# resubmitted or resumed job does no duplicate work. A failed evaluation never fails the job.
+case " ${EXTRA_ARGS:-} " in
+    *" --noise_sigma_start "*|*" --temperature "*|*" --lr "*|*" --latent_temperature "*|*" --blend_gate "*|*" --stochastic_latent "*|*" --length_penalty_alpha "*)
+        echo "=== $(date -Is) D2 evaluation of finished new-* runs ==="
+        python eval_d2.py || echo "eval_d2.py exited with $? (training result unaffected)"
+        ;;
+esac
+
+echo "=== $(date -Is) done (exit ${train_status}) ==="

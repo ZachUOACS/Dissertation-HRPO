@@ -14,7 +14,9 @@ What it reports (the project's statistics rules)
   * for every treatment against the baseline with the same (size, variant):
     per-seed delta, per-seed McNemar p (paired on the same questions), the mean and SD
     of the seed deltas, and k-of-n seeds positive / significant-and-positive;
-  * mean completion length over the last 100 training steps (efficiency).
+  * mean completion length over the last 100 training steps (efficiency);
+  * per-seed change in mean greedy TEST tokens per answer, when eval_tokens.py has written
+    eval_tokens.json for both sides (the length-penalty arms are judged on this).
 It never prints a pooled p-value. n = 3 seeds is too few for seed-level tests, so
 the seed-level numbers are descriptive.
 
@@ -78,6 +80,19 @@ def trained_to_end(ckpt_dir):
         return False
 
 
+def load_test_tokens(ckpt_dir):
+    """Mean greedy test tokens per answer from eval_tokens.json (eval_tokens.py), or None.
+    Ignored when older than the eval_results.json it was counted from."""
+    path, src = os.path.join(ckpt_dir, "eval_tokens.json"), os.path.join(ckpt_dir, "eval_results.json")
+    if not os.path.exists(path) or os.path.getmtime(path) < os.path.getmtime(src):
+        return None
+    try:
+        with open(path) as f:
+            return json.load(f)["mean"]
+    except (OSError, KeyError, json.JSONDecodeError):
+        return None
+
+
 def tail_completion_length(ckpt_dir, last=100):
     try:
         with open(os.path.join(ckpt_dir, "trainer_state.json")) as f:
@@ -116,6 +131,7 @@ def load_runs():
             "vec": [1 if r["correct"] else 0 for r in data["results"]],
             "questions": [r["question"] for r in data["results"]],
             "length": tail_completion_length(found[1]),
+            "test_tokens": load_test_tokens(found[1]),
             "dir": exp_dir,
             "passk": load_passk(found[1]),
         }
@@ -263,6 +279,9 @@ def compare(arms):
             chi2, p = mcnemar_test(a["vec"], b["vec"])
             per_seed[str(s)] = {"delta_pp": round((a["acc"] - b["acc"]) * 100, 2),
                                 "mcnemar_p": round(p, 4)}
+            if a.get("test_tokens") and b.get("test_tokens"):
+                per_seed[str(s)]["test_tokens_pct"] = round(
+                    100 * (a["test_tokens"] / b["test_tokens"] - 1), 1)
         if not per_seed:
             continue
         deltas = [v["delta_pp"] for v in per_seed.values()]
@@ -278,6 +297,8 @@ def compare(arms):
                                       for v in per_seed.values()),
             "delta_completion_length": (round(sum(la) / len(la) - sum(lb) / len(lb), 1)
                                         if la and lb else None),
+            "test_tokens_pct": [v["test_tokens_pct"] for v in per_seed.values()
+                                if "test_tokens_pct" in v],
         })
     return rows
 
@@ -300,7 +321,8 @@ def main():
                        for s, d in r["per_seed"].items())
         print(f"{r['arm']:<58} mean={r['mean_delta_pp']:+.2f} sd={r['sd_delta_pp']:.2f} "
               f"positive {r['k_positive']}/{r['n']} (sig+ {r['k_positive_and_p05']}/{r['n']}) "
-              f"dLen={r['delta_completion_length']}  {per}")
+              f"dLen={r['delta_completion_length']}  {per}"
+              + (f"  testTok% {r['test_tokens_pct']}" if r["test_tokens_pct"] else ""))
     pk_summary, pk_rows = summarise_passk(arms), compare_passk(arms)
     if pk_summary:
         print("\n=== Sampled evaluation (avg@k / pass@k / maj@k %, seed means) ===")
