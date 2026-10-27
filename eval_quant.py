@@ -43,11 +43,13 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--schemes", nargs="+", default=["bf16", "int8", "int4", "nf4"],
                         choices=SCHEMES)
-    parser.add_argument("--task", default="math", choices=["math", "gsm8k"])
+    parser.add_argument("--task", default="math", choices=["math", "gsm8k", "mmlu"])
     parser.add_argument("--variants", nargs="+", default=None,
                         help="exact run ids (e.g. v3_learned_lambda-seed43-rp1-drboth-dsmath); "
                              "searched among the Dr. GRPO baselines and the new-* arms")
-    parser.add_argument("--sizes", nargs="+", default=["1.5b", "3b"])
+    # 1.5b only by default: run ids carry no size, so a 3B Dr. GRPO baseline at seed 42 has the same
+    # id as the 1.5B one and would otherwise join every job that names that id. --sizes 3b for 3B.
+    parser.add_argument("--sizes", nargs="+", default=["1.5b"])
     parser.add_argument("--no_latent_off", action="store_true",
                         help="skip the blend-off evaluations of the latent arms")
     # 32, as for every settled greedy result (see eval_d2.py on why the batch size matters).

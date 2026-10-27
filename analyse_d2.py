@@ -36,13 +36,14 @@ import os
 import re
 from collections import defaultdict
 
+from model_registry import SIZE_ALT, TASK_SUFFIX, TASK_TEST_SIZE, baseline_tag, task_from_name
 from passk_utils import paired_t
 from stats_utils import mcnemar_test, wilson_ci
 
-TASK_FULL = {"gsm8k": 1319, "math": 500}
+TASK_FULL = dict(TASK_TEST_SIZE)
 # Cold Dr. GRPO arms of the settled studies: the controls for every D2 treatment.
-BASELINE_TAGS = ("drboth", "drboth-dsmath")
-BASE_RE = re.compile(r"^(?P<size>0\.5b|1\.5b|3b)-(?P<variant>v\d_[a-z_]+?)(?P<rest>(?:-.*)?)$")
+BASELINE_TAGS = tuple(baseline_tag(t) for t in TASK_SUFFIX)
+BASE_RE = re.compile(rf"^(?P<size>{SIZE_ALT})-(?P<variant>v\d_[a-z_]+?)(?P<rest>(?:-.*)?)$")
 
 
 def split_name(dirname):
@@ -193,7 +194,7 @@ def compare_passk(arms):
     for (size, variant, tag), seeds in sorted(arms.items()):
         if tag in BASELINE_TAGS:
             continue
-        base_tag = "drboth-dsmath" if "-dsmath" in tag else "drboth"
+        base_tag = baseline_tag(task_from_name(tag))
         base = arms.get((size, variant, base_tag))
         if not base:
             continue
@@ -266,7 +267,7 @@ def compare(arms):
         if tag in BASELINE_TAGS:
             continue
         # A MATH treatment is compared with the MATH baseline, never the GSM8K one.
-        base_tag = "drboth-dsmath" if "-dsmath" in tag else "drboth"
+        base_tag = baseline_tag(task_from_name(tag))
         base = arms.get((size, variant, base_tag))
         if not base:
             continue

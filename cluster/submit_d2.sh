@@ -18,6 +18,13 @@
 #            Gumbel temperature C1_TAU (default 0.5).
 #   length   Length-penalised reward (Arora & Zanette 2025) on MATH, v1 AND v3, seeds 43 44
 #            (4 jobs), alpha LP_ALPHA (default 0.2). LP_VARIANTS="3" for v3 only.
+#   scale3b  3B scale check: cold Dr. GRPO v1 and v3 at Qwen2.5-3B, GSM8K and MATH, seed 42 (4 jobs;
+#            GSM8K 48 h, MATH 96 h wall time). S3B_TASKS="math" or S3B_SEEDS="43" to change.
+#   family   Cross-model study (../CROSS_MODEL_PLAN.md): the same configuration on another backbone.
+#            FAM_MODELS (size keys from model_registry.py, default llama1b), FAM_TASKS (gsm8k math
+#            mmlu, default gsm8k; mmlu needs prepare_mmlu_arc.py first), FAM_ARMS (v1 v3 v4 = baselines, c1 = v3 + stochastic latent 0.5,
+#            lt = v3 + latent temperature 1.0; default v1 v3), FAM_SEEDS (default 42 43 44).
+#            e.g. FAM_TASKS="gsm8k math" FAM_ARMS="v1 v3" bash cluster/submit_d2.sh family
 #
 # Usage (from /data/ztay632/Dissertation-HRPO):
 #   bash cluster/submit_d2.sh probe
@@ -48,15 +55,43 @@ submit() {
     local jobname="${JOB_PREFIX:-hrpo-d2}-${tag}"
     export EXTRA_ARGS="$extra"
     local job_id
-    job_id=$(sbatch \
-        --job-name="$jobname" \
-        --time="$WALLTIME" \
-        --output="slurm_logs/${jobname}-%j.log" \
-        --error="slurm_logs/${jobname}-%j.err" \
-        --export="ALL,MODEL_SIZE=${size},VARIANT_NUM=${vnum}" \
-        cluster/run_variant.slurm | awk '{print $4}')
+    if [[ -n "${SUBMIT_DRY_RUN:-}" ]]; then
+        # Tests only (tests/test_family.py): append the job to the file SUBMIT_DRY_RUN names and never
+        # call sbatch. A fake sbatch on the PATH is not safe: on 23 October a test's fake in /tmp
+        # (mounted noexec) was skipped by the PATH search and the real sbatch submitted 40 jobs.
+        printf '%s\t%s\t%s\n' \
+            "--job-name=${jobname} --time=${WALLTIME} ${JOB_MEM:+--mem=$JOB_MEM} --export=ALL,MODEL_SIZE=${size},VARIANT_NUM=${vnum}" \
+            "${AUTO_EVAL_BASELINE:-}" "$extra" >> "$SUBMIT_DRY_RUN"
+        job_id="DRYRUN"
+    else
+        job_id=$(sbatch \
+            --job-name="$jobname" \
+            --time="$WALLTIME" \
+            ${JOB_MEM:+--mem=$JOB_MEM} \
+            --output="slurm_logs/${jobname}-%j.log" \
+            --error="slurm_logs/${jobname}-%j.err" \
+            --export="ALL,MODEL_SIZE=${size},VARIANT_NUM=${vnum}" \
+            cluster/run_variant.slurm | awk '{print $4}')
+    fi
     printf "  %-34s -> job %-10s [%s]\n" "$jobname" "$job_id" "$extra"
     unset EXTRA_ARGS
+}
+
+# Run id of a cold Dr. GRPO baseline, as variant_common.experiment_dir names it (without the size
+# prefix): baseline_id 3 42 math -> v3_learned_lambda-rp1-drboth-dsmath. tests/test_scale3b.py
+# checks it against experiment_dir.
+baseline_id() {
+    local vnum="$1" seed="$2" task="$3" id
+    case "$vnum" in
+        1) id="v1_grpo_baseline" ;;
+        3) id="v3_learned_lambda" ;;
+        4) id="v4_full_hrpo_gate" ;;
+        *) echo "baseline_id: variant $vnum not supported" >&2; return 1 ;;
+    esac
+    [[ "$seed" != 42 ]] && id="${id}-seed${seed}"
+    id="${id}-rp1-drboth"
+    [[ "$task" == math ]] && id="${id}-dsmath"
+    echo "$id"
 }
 
 case "$WHICH" in
@@ -178,8 +213,107 @@ case "$WHICH" in
         done
         unset JOB_PREFIX
         ;;
+    scale3b)
+        # Scale check: the settled cold Dr. GRPO configuration at Qwen2.5-3B-Instruct, v1 and v3,
+        # GSM8K and MATH, one seed (S3B_SEEDS, default 42): 4 jobs. Everything except the model
+        # size is the 1.5B baselines' configuration, so the directories are baseline names
+        # (experiments/3b-v{1,3}_...-rp1-drboth[-dsmath]) and any later 3B arm pairs with them.
+        # Each job scores its own run when training ends (AUTO_EVAL_BASELINE, run_variant.slurm);
+        # v3 also with the latent off. Wall times: 3B GSM8K took 17.4 to 20.1 h before; 1.5B MATH
+        # takes 30 to 33 h, so 3B MATH is expected near 3 days. The cluster has no 48 h cap (job
+        # 17550 trained 58.3 h). Host memory 32G: a 4 GB host OOM once killed a MATH job silently.
+        S3B_SEEDS="${S3B_SEEDS:-42}"
+        S3B_TASKS="${S3B_TASKS:-gsm8k math}"
+        export JOB_PREFIX="hrpo-3b" JOB_MEM="${JOB_MEM:-32G}"
+        GSM8K_ARGS="--repetition_penalty 1.0 --dr_grpo both"
+        MATH_ARGS="--dataset math --repetition_penalty 1.0 --max_completion_length 1024"
+        MATH_ARGS="$MATH_ARGS --per_device_train_batch_size 8 --gradient_accumulation_steps 4 --dr_grpo both"
+        echo "== 3B scale check (Dr. GRPO), v1 and v3, tasks: ${S3B_TASKS}, seeds: ${S3B_SEEDS} =="
+        for task in $S3B_TASKS; do
+            if [[ "$task" == math ]]; then
+                WALLTIME="${MATH_WALLTIME:-96:00:00}"; args="$MATH_ARGS"
+            else
+                WALLTIME="${GSM8K_WALLTIME:-48:00:00}"; args="$GSM8K_ARGS"
+            fi
+            for v in 1 3; do
+                for seed in $S3B_SEEDS; do
+                    export AUTO_EVAL_BASELINE
+                    AUTO_EVAL_BASELINE="$(baseline_id "$v" "$seed" "$task")"
+                    submit "${task}-v${v}-s${seed}" 3b "$v" "$args --seed ${seed}"
+                    echo "      scores ${AUTO_EVAL_BASELINE} (3b) when training ends"
+                done
+            done
+        done
+        unset JOB_PREFIX JOB_MEM AUTO_EVAL_BASELINE
+        ;;
+    family)
+        # Cross-model study (../CROSS_MODEL_PLAN.md). Exactly the settled cold Dr. GRPO configuration
+        # of the Qwen runs (the same arguments as scale3b) on another backbone, one job per
+        # (model, task, arm, seed). Baselines (v1 v3 v4) are plain baseline directories
+        # (experiments/<key>-v{1,3,4}_...-rp1-drboth[-dsmath]) and score themselves when training
+        # ends (AUTO_EVAL_BASELINE; v3 and v4 also with the latent off). Treatments are new-* runs
+        # (c1 -> -sl0.5, lt -> -lt1), scored by run_variant.slurm's D2 branch, and are compared
+        # with the v3 baseline of the same model, task and seed: submit the baselines with them.
+        FAM_MODELS="${FAM_MODELS:-llama1b}"
+        FAM_TASKS="${FAM_TASKS:-gsm8k}"
+        FAM_ARMS="${FAM_ARMS:-v1 v3}"
+        FAM_SEEDS="${FAM_SEEDS:-42 43 44}"
+        export JOB_MEM="${JOB_MEM:-32G}"
+        GSM8K_ARGS="--repetition_penalty 1.0 --dr_grpo both"
+        MATH_ARGS="--dataset math --repetition_penalty 1.0 --max_completion_length 1024"
+        MATH_ARGS="$MATH_ARGS --per_device_train_batch_size 8 --gradient_accumulation_steps 4 --dr_grpo both"
+        # mmlu: HRPO's merged MMLU auxiliary + ARC-C set (GSM8K-sized subset, mmlu_data.py). Prompts up to
+        # 1024 tokens (HRPO's hrpo_mmlu.py; prepare_mmlu_arc.py keeps only prompts that fit for every
+        # backbone); completions 512 as on GSM8K; batch settings are the parser defaults (8 x 4).
+        MMLU_ARGS="--dataset mmlu --max_prompt_length 1024 --repetition_penalty 1.0 --dr_grpo both"
+        if [[ " ${FAM_TASKS} " == *" mmlu "* && ! -d data/mmlu_arc_train_7473 ]]; then
+            echo "family: data/mmlu_arc_train_7473 missing; run python prepare_mmlu_arc.py first" >&2; exit 1
+        fi
+        echo "== Cross-model study: models ${FAM_MODELS}, tasks ${FAM_TASKS}, arms ${FAM_ARMS}, seeds ${FAM_SEEDS} =="
+        for model in $FAM_MODELS; do
+            grep -q "^    \"${model}\":" model_registry.py \
+                || { echo "family: unknown model '${model}' (keys are in model_registry.py)" >&2; exit 1; }
+            export JOB_PREFIX="hrpo-fam-${model}"
+            for task in $FAM_TASKS; do
+                case "$task" in
+                    gsm8k) args="$GSM8K_ARGS" ;;
+                    math)  args="$MATH_ARGS" ;;
+                    mmlu)  args="$MMLU_ARGS" ;;
+                    *) echo "family: unknown task '$task' (gsm8k math mmlu)" >&2; exit 1 ;;
+                esac
+                # Generous limits: Qwen 1.5B takes ~8 h (GSM8K) and 30-33 h (MATH), Qwen 3B ~19 h
+                # and ~30 h. A run that hits its limit resumes from its last checkpoint when the
+                # same command is submitted again.
+                case "${model}:${task}" in
+                    *3b:math)  WALLTIME="${MAX_WALLTIME:-96:00:00}" ;;
+                    *:math)    WALLTIME="${MAX_WALLTIME:-60:00:00}" ;;
+                    *3b:gsm8k) WALLTIME="${MAX_WALLTIME:-48:00:00}" ;;
+                    *3b:mmlu)  WALLTIME="${MAX_WALLTIME:-60:00:00}" ;;
+                    *:mmlu)    WALLTIME="${MAX_WALLTIME:-36:00:00}" ;;
+                    *)         WALLTIME="${MAX_WALLTIME:-24:00:00}" ;;
+                esac
+                for arm in $FAM_ARMS; do
+                    for seed in $FAM_SEEDS; do
+                        case "$arm" in
+                            v1|v3|v4)
+                                export AUTO_EVAL_BASELINE
+                                AUTO_EVAL_BASELINE="$(baseline_id "${arm#v}" "$seed" "$task")" || exit 1
+                                submit "${task}-${arm}-s${seed}" "$model" "${arm#v}" "$args --seed ${seed}"
+                                echo "      scores ${AUTO_EVAL_BASELINE} (${model}) when training ends"
+                                unset AUTO_EVAL_BASELINE
+                                ;;
+                            c1) submit "${task}-v3-sl0.5-s${seed}" "$model" 3 "$args --seed ${seed} --stochastic_latent 0.5" ;;
+                            lt) submit "${task}-v3-lt1.0-s${seed}" "$model" 3 "$args --seed ${seed} --latent_temperature 1.0" ;;
+                            *)  echo "family: unknown arm '$arm' (v1 v3 v4 c1 lt)" >&2; exit 1 ;;
+                        esac
+                    done
+                done
+            done
+        done
+        unset JOB_PREFIX JOB_MEM
+        ;;
     *)
-        echo "unknown tier '$WHICH' (probe | d2 | d2sweep | math | latent | d3 | c1 | length)" >&2
+        echo "unknown tier '$WHICH' (probe | d2 | d2sweep | math | latent | d3 | c1 | length | scale3b | family)" >&2
         exit 1
         ;;
 esac

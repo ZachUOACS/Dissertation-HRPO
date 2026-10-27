@@ -31,6 +31,7 @@ import torch
 
 from eval_gsm8k import evaluate_model
 from stats_utils import wilson_ci, mcnemar_test
+from model_registry import TASK_TEST_SIZE as REGISTRY_TEST_SIZE, task_from_name
 from variant_common import (MODEL_NAMES, VARIANT_CHAIN, GATE_MODES, training_incomplete,
                             parse_experiment_name)
 
@@ -103,7 +104,7 @@ def discover_experiments():
                 "gate_mode": GATE_MODES.get(base_variant, "standard"),
                 "temperature": get_run_temperature(exp_dir),
                 # Which dataset this run was trained on, from its -ds suffix.
-                "task": "math" if "-dsmath" in suffix else "gsm8k",
+                "task": task_from_name(suffix),
                 "training_complete": not training_incomplete(exp_dir),
                 "in_chain": base_variant in VARIANT_CHAIN and not suffix,
             })
@@ -149,7 +150,7 @@ def eval_is_complete(path: str, expected_total: int) -> bool:
 
 # Reported test-set size per task. FULL_TEST_SIZE (1319) is GSM8K's; a MATH
 # run evaluated against it would look permanently incomplete and be skipped.
-TASK_TEST_SIZE = {"gsm8k": FULL_TEST_SIZE, "math": 500}
+TASK_TEST_SIZE = dict(REGISTRY_TEST_SIZE)   # gsm8k 1319, math 500, mmlu 4325 (model_registry)
 
 def run_missing_evals(runs, batch_size, num_samples, sizes_present,
                       latent_off=False):

@@ -22,11 +22,10 @@ import types
 import torch
 from transformers import TrainerCallback
 
-MODEL_NAMES = {
-    "0.5b": "Qwen/Qwen2.5-0.5B-Instruct",
-    "1.5b": "Qwen/Qwen2.5-1.5B-Instruct",
-    "3b": "Qwen/Qwen2.5-3B-Instruct",
-}
+# The backbones and their size keys live in model_registry.py (standard library only, so the
+# analysis scripts share the same list); re-exported here so `from variant_common import
+# MODEL_NAMES` keeps working.
+from model_registry import MODEL_NAMES, SIZE_ALT  # noqa: E402
 
 GATE_MODULES = [
     "thinking_residual_gate_r",
@@ -81,7 +80,9 @@ GATE_MODES = {
 # Lengths are deliberately NOT defaulted per dataset — the submission script
 # passes them explicitly so run_config.json records what each run trained with
 # (the HRPO paper's MATH row uses 1024-token completions against GSM8K's 512).
-DATASETS = ("gsm8k", "math")
+# mmlu: HRPO's merged MMLU auxiliary + ARC-C training set, a fixed GSM8K-sized subset built by
+# prepare_mmlu_arc.py (mmlu_data.py); cross-model study, CROSS_MODEL_PLAN.md.
+DATASETS = ("gsm8k", "math", "mmlu")
 
 
 def build_train_dataset(dataset: str, chunk_size: int = 500, math_root: str = None):
@@ -95,6 +96,14 @@ def build_train_dataset(dataset: str, chunk_size: int = 500, math_root: str = No
     if dataset == "math":
         return utils.preprocess_math_dataset("train", chunk_size=chunk_size,
                                              root=math_root)
+    if dataset == "mmlu":
+        import mmlu_data
+        from datasets import Dataset
+        if not os.path.isdir(mmlu_data.TRAIN_ROOT):
+            raise SystemExit(f"{mmlu_data.TRAIN_ROOT} missing: run python prepare_mmlu_arc.py first")
+        return Dataset.load_from_disk(mmlu_data.TRAIN_ROOT).map(
+            utils.process_mmlu, batched=True, batch_size=chunk_size,
+            load_from_cache_file=False)
     raise ValueError(f"unknown dataset {dataset!r}; expected one of {DATASETS}")
 
 
@@ -103,7 +112,8 @@ def reward_answer_fn(dataset: str):
     string after '####', MATH compares the contents of a boxed expression."""
     import utils
     return {"gsm8k": utils.process_gsm8k_answer,
-            "math": utils.process_math_answer}[dataset]
+            "math": utils.process_math_answer,
+            "mmlu": utils.process_mmlu_answer}[dataset]
 
 
 # ---------------------------------------------------------------------------
@@ -255,6 +265,10 @@ def build_arg_parser(variant_id: str) -> argparse.ArgumentParser:
                              "training (Stage-0 brief verification check 3)")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--report_to", type=str, default="wandb")
+    # Smoke tests only: stop after this many optimizer steps and save a checkpoint there. The run
+    # goes to experiments/smoke-..., never to a real run's directory (experiment_dir).
+    parser.add_argument("--max_steps", type=int, default=-1,
+                        help="smoke tests only: train this many steps (default: one epoch)")
     return parser
 
 
@@ -350,13 +364,18 @@ def experiment_dir(model_size: str, variant_id: str, args=None) -> str:
             new_tokens.append(f"-lp{length_alpha:g}")
         if new_tokens:
             name = "new-" + name + "".join(new_tokens)
+        # Smoke runs (--max_steps) go under "smoke-", which no directory regex in the repo matches
+        # (all are anchored on a size key or "new-"), so a few-step run can never be discovered,
+        # evaluated or pooled as a real one, nor resume into a real run's directory.
+        if getattr(args, "max_steps", -1) and getattr(args, "max_steps", -1) > 0:
+            name = f"smoke-{name}-steps{args.max_steps}"
     return f"./experiments/{name}"
 
 
 # experiments/{size}-{base_variant}[-suffix], where suffix marks a follow-up run
 # (-seed43, -rp1, -loraattention, -warmon, -drboth, -dsmath, or a combination).
 EXPERIMENT_NAME_RE = re.compile(
-    r"^(?P<size>0\.5b|1\.5b|3b)-(?P<variant>v\d_[a-z_]+?)(?P<suffix>-(?:seed|rp|lora|warm|dr|ds).*)?$"
+    rf"^(?P<size>{SIZE_ALT})-(?P<variant>v\d_[a-z_]+?)(?P<suffix>-(?:seed|rp|lora|warm|dr|ds).*)?$"
 )
 
 
@@ -718,6 +737,17 @@ def train_with_resume(trainer, exp_dir: str, args):
     apply_stochastic_latent(trainer, args)
     # Length penalty, same reason.
     apply_length_penalty(trainer, args)
+    # Llama 3.2's chat template stamps today's date into the prompt; pin it (no-op for Qwen), same
+    # reason as above. The trainer applies the template per batch, so this reaches every rollout.
+    from model_registry import pin_chat_template_date
+    if pin_chat_template_date(getattr(trainer, "processing_class", None)):
+        print("[chat template] date_string pinned for reproducible prompts")
+    # Smoke test: a few steps, with a checkpoint at the last one so it can be evaluated. Set here,
+    # before train(), which reads both values when it builds its schedule and save callback.
+    if getattr(args, "max_steps", -1) > 0:
+        trainer.args.max_steps = args.max_steps
+        trainer.args.save_steps = args.max_steps
+        print(f"[smoke] stopping after {args.max_steps} steps, checkpoint at step {args.max_steps}")
 
     trainer.train(resume_from_checkpoint=resume)
 

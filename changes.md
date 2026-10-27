@@ -2239,3 +2239,162 @@ Fix:
   (std 1e-6) added; stand-in config gets to_dict().
 Verified locally: tests/test_weight_quant.py 10 passed, 1 skipped (the NF4 test needs CUDA). NOT verified: the
 NF4 test and any model run.
+
+### 3B scale check: launch tier and auto-scoring (2026-10-14)
+Plan (Project_record 7f): cold Dr. GRPO v1 and v3 at Qwen2.5-3B-Instruct, one seed, GSM8K and MATH, as a
+descriptive scale check. The earlier 3B runs (July) used the old settings and are not usable as baselines.
+* cluster/submit_d2.sh tier `scale3b` (4 jobs, job prefix hrpo-3b): the 1.5B baselines' exact arguments
+  (GSM8K: --repetition_penalty 1.0 --dr_grpo both; MATH: tier10's MATH_ARGS) with MODEL_SIZE=3b, seed
+  S3B_SEEDS (default 42), tasks S3B_TASKS (default "gsm8k math"). Wall time GSM8K_WALLTIME 48 h, MATH_WALLTIME
+  96 h (3B GSM8K took 17.4-20.1 h before; 1.5B MATH 30-33 h; no 48 h cap on this cluster). Host memory
+  JOB_MEM=32G (submit() passes --mem only when JOB_MEM is set, so other tiers are unchanged). Directories are
+  baseline names (experiments/3b-v{1,3}_...-rp1-drboth[-dsmath]), so later 3B arms pair with them.
+  baseline_id() gives the run id each job scores.
+* cluster/run_variant.slurm: when AUTO_EVAL_BASELINE is set and training exited 0, score that run on the same
+  GPU (eval_d2.py --baselines --sizes $MODEL_SIZE --exact --variants $AUTO_EVAL_BASELINE), and for v3 also
+  with the latent off. Queued jobs keep the script copy they were submitted with.
+* eval_d2.py: --sizes (run ids carry no size: a 3B seed-42 baseline has the 1.5B one's id) and --baselines
+  (greedy / latent-off mode also scores the selected finished Dr. GRPO baselines). Defaults unchanged. Fixed
+  a KeyError the new path would have hit: baseline runs have no latent_temperature/blend_gate keys (print now
+  uses .get).
+* eval_quant.py: --sizes default ["1.5b"] (was 1.5b and 3b), so a finished 3B baseline never joins a 1.5B
+  quantisation job that names the same id. --sizes 3b for a 3B quantisation pass.
+* analyse_scale.py (new, standard library): v3 - v1 per (size, task, seed) with McNemar (continuity
+  corrected, as stats_utils), v3 latent-off cost, mean test tokens when eval_tokens.json exists; per (size,
+  task) seed mean and sign count; results/scale_analysis.json. On the synced 1.5B results it reproduces the
+  record: MATH +12.40 / +2.40 / +3.60 (p 0.000 / 0.241 / 0.086), latent-off -1.00 / -2.00 / -2.40.
+* tests/test_scale3b.py: the tier's arguments name a baseline (no new- prefix) and baseline_id equals
+  experiment_dir's id (v1/v3 x seeds 42/43 x both tasks, via bash); where the 1.5B baselines'
+  train_summary.json exists, every argument equals what they trained with except model_size; MATH settings;
+  run_variant block guarded by train_status and latent-off only for v3; eval_quant default size;
+  eval_d2 --baselines --sizes 3b --exact selects only the 3B run, default mode unchanged, pass@k sized;
+  analyse_scale pairing, McNemar counts, latent-off cost, question mismatch raises.
+Verified locally (CPU torch 2.5.1, peft 0.15.0, transformers 4.53.3): test_scale3b 13 passed, 1 skipped (the
+baseline comparison needs the cluster's train_summary files); with a fake sbatch the tier submits the four
+jobs with the expected names, times, memory, arguments and ids. Against a synced 1.5B MATH run of the same
+base config (the seed-43 v1 noise run) the tier's arguments differ only in that run's noise keys. NOT verified:
+any 3B training run.
+
+### analyse_quant.py: smoke-test merge check and format rates (2026-10-14)
+* Smoke test 27486 (v3 seed 43, 32 questions) printed an empty merge check: it compared only identical question
+  lists, and eval_results.json has 500. It now compares on the shared prefix (a --num_samples run scores the
+  first n questions) and prints "k of n answers changed"; a run with nothing comparable says so.
+* Format rates per scheme, latent on and off: share of answers containing "####" and share cut at the token
+  cap (MATH 1024, GSM8K 512, as eval_gsm8k.get_task_spec). Why: the scorer does not need the marker. Without
+  it, extract_from_response passes the whole response on and process_math_answer takes the boxed value, else
+  the LaTeX value, else the last number (utils.py), so a truncated answer can score. The smoke test showed
+  this: an int4 latent-off answer cut at 1024 tokens scored correct, and both int4 latent-on answers looked at
+  had no "####". Since generation keeps the latent on until "####" appears
+  (transformers/generation/utils.py: is_thinking = answer_start not in the decoded text), the marker rate also
+  says how much of each answer was generated with the latent on.
+Verified locally on synthetic files (a 32-question smoke file against a 500-question original; the older
+synthetic tree still runs). NOT verified: on real files.
+
+### Length penalty: first live check (2026-10-14, job 27487, v1 seed 43)
+Logged step: reward 0.03125 (1 correct of 32 completions), reward_shaped 0.028125 = 0.9 x 0.03125, which is
+what a lone correct answer in its group earns (f = 1/2, 1 - 0.2 x 0.5). length_f 0.125: GRPOTrainer.log averages
+each metric over the step's 4 micro-batches (trl/trainer/grpo_trainer.py:778), and a micro-batch with no correct
+answer appends 0, so the logged length_f is the per-micro-batch value (here 0.5) diluted by micro-batches without
+a correct answer. It is a diagnostic only and not the per-response mean over correct answers; shortening is
+judged from completion_length in training and test tokens (eval_tokens.py). Not changed mid-experiment, so all
+four length runs log it the same way.
+
+### check_quant.py: independent check of the quantisation study (2026-10-18)
+New stdlib script, no existing file changed. It reads the 36 eval_results_wq-*.json files and the settled
+eval_results.json / eval_results_latent_off.json / eval_tokens.json of the six cold Dr. GRPO MATH checkpoints and
+reports (1) merge only against the settled unmerged evaluation, McNemar; (2) each scheme against merged bf16 per
+seed, McNemar, answers changed and token ratio; (3) v3's quantisation cost minus v1's per seed with a
+per-question sign-flip test; (4) accuracy of answers with and without "####". It agrees with analyse_quant.py on
+every number both report. Verified on the real files synced 18 October: question order identical in all 45 files;
+re-tokenising the merged bf16 answers reproduces the generation-time num_tokens at 498 to 500 of 500 answers per
+checkpoint, so eval_tokens.json and num_tokens are comparable. Finding (Project_record §2, §3.4, §7f): merging
+alone changed 59 to 98 of 500 answers per checkpoint.
+
+### Cross-model study, Phase 0: Llama 3.2 support, family tier, smoke test (2026-10-23)
+Plan: ../CROSS_MODEL_PLAN.md. Supervisor asked for other models and a second dataset (23 October).
+* **model_registry.py (new, standard library):** the one list of backbones (MODEL_NAMES, FAMILY) and the regex
+  alternation SIZE_ALT. Adds llama1b = unsloth/Llama-3.2-1B-Instruct and llama3b = unsloth/Llama-3.2-3B-Instruct
+  (unsloth's copies: same weights, no download gate; HTTP 200 anonymously on 23 October). Gemma is deliberately
+  absent until its rollout port exists. variant_common re-exports MODEL_NAMES, so existing imports are unchanged.
+* **Why Llama needs no model code:** the vendored transformers/models/llama/modeling_llama.py already holds HRPO's
+  gate code, identical to modeling_qwen2.py apart from docstrings (diffed), and unsloth runs Qwen2 through its
+  Llama path (unsloth/models/qwen2.py reuses LlamaModel_fast_forward), which holds the hybrid blend
+  (unsloth/models/llama.py:666 training, :944 rollout). The latent is built from get_input_embeddings()
+  (generation/utils.py:3473), so it is model-agnostic.
+* **Directory regexes take the new keys** (variant_common.EXPERIMENT_NAME_RE, eval_d2.NEW_RE, analyse_d2.BASE_RE,
+  analyse_quant.DIR_RE, analyse_scale.DIR_RE) via SIZE_ALT. analyse_scale sorted sizes with float(size[:-1]),
+  which would crash on "llama1b"; it now uses the registry order. Qwen output unchanged (re-run on the 23 October
+  files: identical table).
+* **--max_steps (smoke tests only):** train_with_resume sets trainer.args.max_steps and save_steps before
+  train(); the run goes to experiments/smoke-...-steps<N>, which no directory regex matches, so a smoke run can
+  never be discovered, evaluated, pooled or resumed as a real one. Default -1: real runs unchanged.
+* **Chat template date pinned:** Llama 3.2's template writes today's date into every prompt
+  (strftime_now("%d %b %Y")), so the same checkpoint would get a different prompt on each day it is scored.
+  model_registry.pin_chat_template_date sets date_string to the template's own fallback ("26 Jul 2024"), applied
+  in train_with_resume (trainer.processing_class) and eval_gsm8k.load_model_for_eval. Checked on the real
+  tokenisers: Llama prompt now "Today Date: 26 Jul 2024"; Qwen2.5 prompt byte-identical to before.
+* **eval_tokens.py:** used the Qwen tokeniser for every run; now the run's own backbone's (from the directory's
+  size key). Qwen runs keep exactly the same tokeniser, so existing counts are unchanged.
+* **run_ablations.sh:** variants_for_size accepts llama1b/llama3b (v1 v3 v4). submit_d2.sh: baseline_id supports
+  v4; new tier `family` (FAM_MODELS, FAM_TASKS, FAM_ARMS = v1 v3 v4 c1 lt, FAM_SEEDS) with exactly the scale3b
+  arguments, 32G, wall times 24/48 h (GSM8K 1B/3B) and 60/96 h (MATH), AUTO_EVAL_BASELINE for baselines only;
+  rejects a model key not in the registry.
+* **cluster/run_smoke_family.slurm + smoke_family.py (new):** trains v1, v3, v4, c1, lt on GSM8K and v3 on MATH for
+  4 steps at the real batch settings, scores each on 32 questions (latent on and off), and prints PASS/FAIL:
+  reached the step, finite loss, hidden_ratio > 0 for latent arms and absent for GRPO, scoring ran.
+* **Tests:** tests/test_family.py (new, 24 tests, including a dry run of the family tier with a fake sbatch);
+  tests/test_length_penalty.py now gives SIZE_ALT to the regex it rebuilds from source. Local, rebuilt CPU venv
+  (torch 2.5.1, peft 0.15.0, transformers 4.53.3): 163 passed, 8 skipped (cluster-only or CUDA-only).
+NOT verified: any GPU run on Llama. That is the smoke test (Phase 1).
+
+### Cross-model tests: two fixes after the first cluster run (2026-10-23)
+On the login node 2 of 45 failed, both in the tests:
+* test_family_tier_dry_run recorded 0 jobs with exit 0. The fake sbatch was a file in pytest's /tmp directory,
+  and login nodes mount /tmp noexec, so it failed with "Permission denied", and submit()'s `sbatch | awk` pipeline
+  carried on. The fake is now a bash function exported to the script's shell, which takes precedence over any
+  sbatch on the PATH (the real one included) and needs no exec permission. The helper also asserts that every
+  printed job id is the fake's ("FAKE", never a number).
+* test_scale3b::test_tier_matches_the_trained_1_5b_baselines: the new --max_steps (default -1) is absent from the
+  1.5B baselines' train_summary.json. Listed as an implicit default (-1 = one full epoch, which every real run used).
+Local: 163 passed, 8 skipped.
+
+### INCIDENT: the family dry-run test submitted 40 real jobs (2026-10-23)
+The first version of test_family_tier_dry_run put a fake `sbatch` file in pytest's tmp directory (/tmp) and
+prepended it to PATH. The cluster mounts /tmp noexec, so bash's PATH search treated the fake as not executable,
+kept searching, and ran the real /usr/bin sbatch: jobs 27896 to 27935 (hrpo-fam-llama{1b,3b}-{gsm8k,math}-*,
+seeds 42 and 43) were submitted from the login node. The previous entry's reading ("the real one shouldn't have
+been called") was wrong. All 40, and smoke jobs 27936/27937 (whose first step ran the same test on a compute
+node), were cancelled while still pending; none started.
+Fixes, so a test can never reach the real sbatch:
+* submit_d2.sh submit(): with SUBMIT_DRY_RUN=<file> it appends the job to that file and never calls sbatch.
+* tests/test_family.py uses that mode, and additionally exports a bash function `sbatch` that refuses (exit 99):
+  functions take precedence over the PATH, so a broken dry-run branch still cannot submit. The helper asserts no
+  numeric job id and no "REAL SBATCH BLOCKED" message. A static test checks the dry-run branch has no sbatch call.
+* cluster/run_smoke_family.slurm no longer runs pytest: tests run on the login node only.
+Checked locally with an executable stand-in "real" sbatch first on the PATH that writes a marker file: not called
+in dry-run mode, and blocked by the function with dry-run mode off. Full suite: 164 passed, 8 skipped.
+
+### Cross-model study: third task "mmlu" and SmolLM2 in the registry (2026-10-23)
+* **mmlu_data.py (new):** HRPO's MMLU / ARC-C setting. Training: cais/mmlu auxiliary_train (99,842; rows nested
+  under "train") + allenai/ai2_arc ARC-Challenge train (1,119), merged as HRPO did (their Section 4.2), then a fixed
+  GSM8K-sized subset (7,473 questions, seed 0) because one epoch of the full set is ~12,600 steps. Test:
+  TIGER-Lab/MMLU-STEM test (3,153) + ARC-C test (1,172) = 4,325, scored as one set with each answer's source.
+  Prompt text = utils.process_mmlu's (test asserts equality).
+* **prepare_mmlu_arc.py (new, login node):** builds the subset in data/mmlu_arc_train_7473 with manifest.json. A
+  question is skipped if its full chat prompt exceeds 1,024 tokens (HRPO's hrpo_mmlu.py --max_prompt_length) for ANY
+  registered backbone's tokeniser, so no prompt is truncated. Refuses to overwrite. Run locally into the scratchpad:
+  100,961 merged; kept 7,473 (7,389 MMLU auxiliary, 84 ARC-C); 29 skipped over 1,024 tokens; longest kept 1,016;
+  sha256 of the kept questions 4a7988a4466c0c19... (the cluster run should print the same).
+* **Wiring:** variant_common DATASETS += mmlu (build_train_dataset loads the subset and maps utils.process_mmlu;
+  reward utils.process_mmlu_answer); experiment_dir gives "-dsmmlu". eval_gsm8k task "mmlu" (q prompt_text, gold
+  letter, max_new 512, max_seq_length 1536, result field "source"). Task detection and test sizes now come from
+  model_registry (TASK_SUFFIX, TASK_TEST_SIZE, task_from_name, baseline_tag) in eval_all, eval_d2, analyse_d2,
+  analyse_scale; eval_quant --task accepts mmlu. Qwen output of analyse_scale unchanged.
+* **submit_d2.sh family:** FAM_TASKS accepts mmlu (--dataset mmlu --max_prompt_length 1024; completions 512; batch
+  8 x 4; wall time 36 h, 60 h for 3B); refuses mmlu if the subset is missing.
+* **Smoke:** SMOKE_ARMS selects arms (default the original six, so already-submitted smoke jobs are unchanged);
+  new arms v1mmlu, v3mmlu; smoke_family.py --arms.
+* **model_registry:** smollm2 = HuggingFaceTB/SmolLM2-1.7B-Instruct (LlamaForCausalLM, tied embeddings, hidden 2048,
+  24 layers, vocab 49,152; ChatML template with a system role, no date stamp; ungated: all from its config and
+  tokenizer_config on 23 October). Optional third lineage, no port.
+* Tests: tests/test_family.py 31 passed; full suite 171 passed, 7 skipped.

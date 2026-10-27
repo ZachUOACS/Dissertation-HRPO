@@ -34,10 +34,11 @@ import torch
 
 from eval_all import (TASK_TEST_SIZE, discover_experiments, final_checkpoint,
                       get_run_temperature, run_missing_evals)
+from model_registry import SIZE_ALT, TASK_SUFFIX, baseline_tag, task_from_name
 from variant_common import GATE_MODES, MODEL_NAMES, training_incomplete
 
 NEW_RE = re.compile(
-    r"^new-(?P<size>0\.5b|1\.5b|3b)-(?P<variant>v\d_[a-z_]+?)"
+    rf"^new-(?P<size>{SIZE_ALT})-(?P<variant>v\d_[a-z_]+?)"
     r"(?P<suffix>-(?:seed|rp|lora|warm|dr|ds|t|lr|noise|lt|sl|dg|lp).*)?$"
 )
 
@@ -110,7 +111,7 @@ def discover_new_runs():
             "temperature": get_run_temperature(exp_dir),
             "latent_temperature": get_run_latent_temperature(exp_dir),
             "blend_gate": get_run_blend_gate(exp_dir),
-            "task": "math" if "-dsmath" in suffix else "gsm8k",
+            "task": task_from_name(suffix),
             "training_complete": True,
         })
     return runs
@@ -126,7 +127,7 @@ def discover_baselines():
             continue
         suffix = run["variant_id"][len(run["base_variant"]):]
         tag = re.sub(r"-seed\d+", "", suffix)
-        if tag in ("-rp1-drboth", "-rp1-drboth-dsmath"):
+        if tag in tuple("-rp1-" + baseline_tag(t) for t in TASK_SUFFIX):
             runs.append(run)
     return runs
 
@@ -209,6 +210,14 @@ def main():
     parser.add_argument("--exact", action="store_true",
                         help="with --variants: match run ids exactly instead of by substring, so a "
                              "baseline id does not also select every new arm built on it")
+    # Run ids carry no model size (a 3B seed-42 baseline has the 1.5B one's id), so a 3B run is
+    # selected by --sizes, never by id alone.
+    parser.add_argument("--sizes", nargs="+", default=None,
+                        help="only runs of these model sizes (default: all)")
+    parser.add_argument("--baselines", action="store_true",
+                        help="greedy / latent-off mode: also score the finished cold Dr. GRPO "
+                             "baselines selected by --variants/--sizes (how the 3B scale-check "
+                             "runs are scored; the 1.5B ones are all complete and are skipped)")
     args = parser.parse_args()
 
     def selected(variant_id):
@@ -216,16 +225,27 @@ def main():
             return variant_id in args.variants
         return any(v in variant_id for v in args.variants)
 
-    runs = discover_new_runs()
+    def sized(run_list):
+        return [r for r in run_list if not args.sizes or r["model_size"] in args.sizes]
+
+    runs = sized(discover_new_runs())
     if args.variants:
         runs = [r for r in runs if selected(r["variant_id"])]
-    print(f"Discovered {len(runs)} evaluable new-arm experiments:")
+    if args.baselines and args.passk == 0:
+        baselines = sized(discover_baselines())
+        if args.variants:
+            baselines = [r for r in baselines if selected(r["variant_id"])]
+        print(f"Discovered {len(baselines)} finished Dr. GRPO baseline(s) to score:")
+        for r in baselines:
+            print(f"  {r['model_size']:>5} {r['variant_id']:<58} temp={r['temperature']}")
+        runs = baselines + runs
+    print(f"Discovered {len(runs)} evaluable experiments:")
     for r in runs:
         print(f"  {r['model_size']:>5} {r['variant_id']:<58} temp={r['temperature']}"
-              f" latent_temp={r['latent_temperature']} blend_gate={r['blend_gate']}")
+              f" latent_temp={r.get('latent_temperature')} blend_gate={r.get('blend_gate')}")
 
     if args.passk > 0:
-        baselines = discover_baselines()
+        baselines = sized(discover_baselines())
         if args.variants:
             baselines = [r for r in baselines if selected(r["variant_id"])]
         print(f"plus {len(baselines)} Dr. GRPO baseline(s) for the sampled evaluation:")

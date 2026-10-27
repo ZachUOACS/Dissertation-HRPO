@@ -64,6 +64,9 @@ variants_for_size() {
     case "$1" in
         1.5b) echo "v1 v2 v3 v4 v5 v6" ;;
         0.5b|3b) echo "v1 v2 v4 v6" ;;
+        # Cross-model study (CROSS_MODEL_PLAN.md): GRPO, HRPO v3 and the published HRPO v4.
+        # Keys must match model_registry.MODEL_NAMES.
+        llama1b|llama3b|smollm2) echo "v1 v3 v4" ;;
         *) echo "Unknown model size: $1" >&2; return 1 ;;
     esac
 }

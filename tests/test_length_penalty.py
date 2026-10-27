@@ -127,6 +127,8 @@ def test_naming_fingerprint_and_setup():
     src = open(os.path.join(ROOT, "eval_d2.py"), encoding="utf-8").read()
     node = next(n for n in ast.parse(src).body if isinstance(n, ast.Assign)
                 and getattr(n.targets[0], "id", "") == "NEW_RE")
-    new_re = eval(compile(ast.Expression(node.value), "eval_d2.py", "eval"), {"re": re})
+    from model_registry import SIZE_ALT
+    new_re = eval(compile(ast.Expression(node.value), "eval_d2.py", "eval"),
+                  {"re": re, "SIZE_ALT": SIZE_ALT})
     m = new_re.match(name)
     assert m and m.group("variant") == "v3_learned_lambda" and m.group("suffix").endswith("-lp0.2")

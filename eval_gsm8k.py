@@ -36,13 +36,17 @@ def load_model_for_eval(model_path: str, adapter_path: str, gate_mode: str = "st
         model_name = model_path,
         # MATH decodes 1024 new tokens on top of the prompt; 1024 total
         # would truncate. (eval_math.py uses 1536 for the same reason.)
-        max_seq_length = 1536 if task == "math" else 1024,
+        max_seq_length = 1536 if task in ("math", "mmlu") else 1024,
         load_in_4bit = False,
         fast_inference = False,
     )
     model.answer_start = ANSWER_START
     tokenizer.padding_side = "left"
     tokenizer.pad_token = tokenizer.eos_token
+    # Same prompts as in training: Llama 3.2's template would otherwise stamp today's date into
+    # every prompt (model_registry.pin_chat_template_date; no-op for Qwen).
+    from model_registry import pin_chat_template_date
+    pin_chat_template_date(tokenizer)
 
     u_init = None
     if gate_mode == "constant":
@@ -119,8 +123,16 @@ def get_task_spec(task: str):
         q_key, a_key, max_new = 'problem', 'solution', 1024
         answer_fn = process_math_answer
         gold_fn = lambda gold: process_math_answer(extract_boxed_answer(gold) or "")
+    elif task == "mmlu":
+        # Cross-model study: MMLU-STEM test + ARC-C test as one set (mmlu_data.load_test_set), the
+        # prompt text built exactly as in training, the gold a letter, each answer's source kept.
+        from mmlu_data import load_test_set
+        dataset = load_test_set()
+        q_key, a_key, max_new = 'prompt_text', 'answer_letter', 512
+        answer_fn = process_mmlu_answer
+        gold_fn = lambda gold: gold
     else:
-        raise ValueError(f"unknown task {task!r}; expected 'gsm8k' or 'math'")
+        raise ValueError(f"unknown task {task!r}; expected 'gsm8k', 'math' or 'mmlu'")
     return dataset, q_key, a_key, max_new, answer_fn, gold_fn
 
 
@@ -241,6 +253,8 @@ def evaluate_model(
                 'full_response': response,
                 'correct': generated_answer == true_answer
             }
+            if 'source' in batch_data:          # mmlu: which test the question is from
+                result['source'] = batch_data['source'][j]
             if weight_quant is not None:
                 generated = output[prompt_length:]
                 ends = (generated == tokenizer.eos_token_id).nonzero()

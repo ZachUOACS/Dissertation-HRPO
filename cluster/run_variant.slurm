@@ -65,4 +65,18 @@ case " ${EXTRA_ARGS:-} " in
         ;;
 esac
 
+# Baseline runs submitted with AUTO_EVAL_BASELINE (submit_d2.sh scale3b): score this run, and for a
+# latent arm also with the blend off, on this GPU once training has finished. Exact id plus size,
+# because a run id carries no size. A job killed at --time never reaches this point, and a failed
+# training (non-zero status) is not scored.
+if [[ -n "${AUTO_EVAL_BASELINE:-}" && $train_status -eq 0 ]]; then
+    echo "=== $(date -Is) scoring ${MODEL_SIZE} ${AUTO_EVAL_BASELINE} ==="
+    python eval_d2.py --baselines --sizes "$MODEL_SIZE" --exact --variants "$AUTO_EVAL_BASELINE" \
+        || echo "eval_d2.py exited with $? (training result unaffected)"
+    if [[ "$VARIANT_NUM" != 1 ]]; then
+        python eval_d2.py --baselines --sizes "$MODEL_SIZE" --exact --variants "$AUTO_EVAL_BASELINE" \
+            --latent_off || echo "eval_d2.py --latent_off exited with $? (training result unaffected)"
+    fi
+fi
+
 echo "=== $(date -Is) done (exit ${train_status}) ==="
